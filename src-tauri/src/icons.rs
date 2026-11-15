@@ -272,7 +272,7 @@ unsafe fn icon_to_data_uri(icon: windows::Win32::UI::WindowsAndMessaging::HICON)
         &mut bmi,
         DIB_RGB_COLORS,
     );
-    let has_alpha = copied != 0 && bgra.chunks_exact(4).any(|pixel| pixel[3] != 0);
+    let has_alpha = copied != 0 && bgra.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0);
 
     // Icons without an alpha channel rely on their 1bpp AND mask for
     // transparency. Without it, transparent pixels render as an opaque black box.
@@ -312,7 +312,7 @@ unsafe fn icon_to_data_uri(icon: windows::Win32::UI::WindowsAndMessaging::HICON)
     if copied == 0 {
         return None;
     }
-    for (index, pixel) in bgra.chunks_exact_mut(4).enumerate() {
+    for (index, pixel) in bgra.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         pixel.swap(0, 2);
         if has_alpha {
             continue;
