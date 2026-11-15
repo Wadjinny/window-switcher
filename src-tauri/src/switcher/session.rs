@@ -8,8 +8,9 @@ use std::{
 
 use tauri::Emitter;
 
-use super::{HookRuntime, SwitcherState};
+use super::{ActiveSwitcher, HookRuntime, SwitcherState};
 use crate::{
+    input::hook::close_hook_session,
     ipc::{SelectionPayload, SwitcherPayload},
     lock_unpoisoned,
     overlay::{hide_overlay, show_overlay},
@@ -44,6 +45,45 @@ pub(crate) fn advance_switcher(
         }
     }
     emit_selection(runtime, watch);
+}
+
+/// Whether hovering card `index` may change session `generation`'s
+/// selection: the session must still be the one on screen, the index must
+/// fall inside its targets, and the card must not already be selected. Pure,
+/// so it is unit tested.
+pub(crate) fn apply_mouse_selection(
+    active: &mut ActiveSwitcher,
+    generation: u64,
+    index: usize,
+) -> bool {
+    if active.generation != generation || index >= active.targets.len() || active.selected == index
+    {
+        return false;
+    }
+    active.selected = index;
+    true
+}
+
+/// The mouse moved over a card: select it and send the new selection to the
+/// overlays, without re-showing or resizing them. Returns whether anything
+/// changed.
+pub(crate) fn select_switcher(runtime: &HookRuntime, generation: u64, index: usize) -> bool {
+    let changed = runtime
+        .state
+        .lock()
+        .ok()
+        .and_then(|mut state| {
+            state
+                .active
+                .as_mut()
+                .map(|active| apply_mouse_selection(active, generation, index))
+        })
+        .unwrap_or(false);
+    if changed {
+        emit_selection(runtime, &mut None);
+        log::debug!("mouse hover selected card {index} of #{generation}");
+    }
+    changed
 }
 
 /// Only the selection moved: send just the new index. The overlay is already
@@ -93,18 +133,65 @@ pub(crate) fn cancel_generation(runtime: &HookRuntime, generation: u64) -> bool 
     was_active
 }
 
-pub(crate) fn commit_switcher(runtime: &HookRuntime, generation: u64, at: Instant) {
-    let mut watch = timing::Stopwatch::start_at("release", at);
+/// The target a commit activates: the card the mouse clicked when it falls
+/// inside the session's targets, otherwise (no click — a modifier release)
+/// the session's own selection. `None` leaves the session open: the
+/// generation is stale or the click index is out of range. Pure, so it is
+/// unit tested.
+pub(crate) fn commit_index(
+    active: &ActiveSwitcher,
+    generation: u64,
+    clicked: Option<usize>,
+) -> Option<usize> {
+    if active.generation != generation {
+        return None;
+    }
+    match clicked {
+        Some(index) => (index < active.targets.len()).then_some(index),
+        None => Some(active.selected),
+    }
+}
+
+/// Commits the switcher: activates the selected window and hides the
+/// overlay. `clicked` is the card the mouse clicked, overriding the current
+/// selection (an out-of-range click leaves the session alone). Returns
+/// whether a window was activated.
+///
+/// A click ends the session itself, so the hook's record of it is dropped
+/// here and the modifier release that follows finds nothing to commit.
+pub(crate) fn commit_switcher(
+    runtime: &HookRuntime,
+    generation: u64,
+    clicked: Option<usize>,
+    at: Instant,
+) -> bool {
+    let mut watch = timing::Stopwatch::start_at(
+        if clicked.is_some() {
+            "click"
+        } else {
+            "release"
+        },
+        at,
+    );
     timing::mark(&mut watch, "dequeued");
     let selection = {
         let _visibility = lock_overlay_visibility();
         let selection = runtime.state.lock().ok().and_then(|mut state| {
+            let selected = state
+                .active
+                .as_ref()
+                .and_then(|active| commit_index(active, generation, clicked))?;
             state
                 .active
                 .take_if(|active| active.generation == generation)
-                .map(|active| (active.targets, active.selected))
+                .map(|active| (active.targets, selected))
         });
         if selection.is_some() {
+            // The click, not a modifier release, is ending this session: the
+            // release that follows must not try to commit it a second time.
+            if clicked.is_some() {
+                close_hook_session(generation);
+            }
             hide_overlay(&runtime.app);
         }
         selection
@@ -112,10 +199,13 @@ pub(crate) fn commit_switcher(runtime: &HookRuntime, generation: u64, at: Instan
     timing::mark(&mut watch, "hidden");
 
     let Some((targets, selected)) = selection else {
-        return;
+        return false;
     };
     if targets.is_empty() {
-        return;
+        return false;
+    }
+    if clicked.is_some() {
+        log::info!("switcher committed by mouse click");
     }
     // A window can disappear between enumeration and activation; walk forward
     // to the next card instead of silently doing nothing.
@@ -127,10 +217,11 @@ pub(crate) fn commit_switcher(runtime: &HookRuntime, generation: u64, at: Instan
             if offset > 0 {
                 log::warn!("selected window was gone; activated the next target instead");
             }
-            return;
+            return true;
         }
     }
     log::warn!("unable to activate any window for the current selection");
+    false
 }
 
 pub(crate) fn payload_snapshot(state: &SwitcherState) -> Option<SwitcherPayload> {
@@ -182,5 +273,83 @@ pub(crate) fn emit_and_show(runtime: &HookRuntime, watch: &mut Option<timing::St
             .map(|json| json.len())
             .unwrap_or(0);
         log::info!("[timing] payload #{} is {bytes} bytes", payload.generation);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ipc::SwitchItem,
+        settings_model::{CardStyle, Layout},
+        targets::Target,
+    };
+    use windows::Win32::Foundation::HWND;
+
+    fn target() -> Target {
+        Target {
+            hwnd: HWND::default(),
+            process_path: std::path::PathBuf::from("C:\\apps\\one.exe"),
+            app_id: None,
+            title: "One".into(),
+            window_count: 1,
+        }
+    }
+
+    /// An open app switcher with `count` cards, `selected` highlighted.
+    fn active(generation: u64, count: usize, selected: usize) -> ActiveSwitcher {
+        ActiveSwitcher {
+            mode: "app".into(),
+            hint: "Win + Tab".into(),
+            generation,
+            card_style: CardStyle::Icon,
+            layout: Layout::Horizontal,
+            targets: (0..count).map(|_| target()).collect(),
+            items: Vec::<SwitchItem>::new(),
+            selected,
+        }
+    }
+
+    #[test]
+    fn hovering_a_card_selects_it() {
+        let mut active = active(7, 3, 0);
+        assert!(apply_mouse_selection(&mut active, 7, 2));
+        assert_eq!(active.selected, 2);
+        // Selecting the card the mouse already sits on changes nothing, so
+        // no selection event is emitted for it.
+        assert!(!apply_mouse_selection(&mut active, 7, 2));
+        assert_eq!(active.selected, 2);
+    }
+
+    #[test]
+    fn hovering_ignores_a_stale_generation() {
+        let mut active = active(7, 3, 0);
+        assert!(!apply_mouse_selection(&mut active, 6, 1));
+        assert_eq!(active.selected, 0);
+    }
+
+    #[test]
+    fn hovering_ignores_an_out_of_range_index() {
+        let mut active = active(7, 3, 0);
+        assert!(!apply_mouse_selection(&mut active, 7, 3));
+        assert_eq!(active.selected, 0);
+    }
+
+    #[test]
+    fn a_release_commit_activates_the_current_selection() {
+        let active = active(7, 3, 1);
+        assert_eq!(commit_index(&active, 7, None), Some(1));
+        // A stale generation leaves the session open.
+        assert_eq!(commit_index(&active, 6, None), None);
+    }
+
+    #[test]
+    fn a_click_commits_the_clicked_card() {
+        let active = active(7, 3, 0);
+        assert_eq!(commit_index(&active, 7, Some(2)), Some(2));
+        // An out-of-range click leaves the session open.
+        assert_eq!(commit_index(&active, 7, Some(3)), None);
+        // So does a click on a session that is no longer on screen.
+        assert_eq!(commit_index(&active, 6, Some(2)), None);
     }
 }

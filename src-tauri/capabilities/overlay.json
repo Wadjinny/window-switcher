@@ -7,6 +7,8 @@
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "allow-switcher-snapshot",
+    "allow-switcher-select",
+    "allow-switcher-click",
     "allow-update-thumbnails",
     "allow-overlay-timing"
   ]

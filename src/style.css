@@ -99,6 +99,9 @@ kbd {
   border-radius: 18px;
   text-align: center;
   overflow: hidden;
+  /* The overlay never takes focus, so a click is safe to offer: it commits
+     the card without activating the overlay. */
+  cursor: pointer;
   transition: background-color var(--selection-ms) ease, border-color var(--selection-ms) ease,
     transform var(--selection-ms) ease, box-shadow var(--selection-ms) ease;
 }

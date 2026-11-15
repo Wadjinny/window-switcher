@@ -247,7 +247,7 @@ impl Controller {
             }
             Command::Commit { generation, at } => {
                 self.stop_watchdog();
-                commit_switcher(self.runtime, generation, at);
+                commit_switcher(self.runtime, generation, None, at);
                 log_hook_timing();
                 self.refresh_app_hint();
             }

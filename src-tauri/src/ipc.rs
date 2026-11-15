@@ -18,7 +18,10 @@ use crate::{
         current_layout, current_monitor_mode,
     },
     settings_window::{settings_is_foreground, RECORDING_HOTKEY},
-    switcher::{session::payload_snapshot, RUNTIME},
+    switcher::{
+        session::{commit_switcher, payload_snapshot, select_switcher},
+        RUNTIME,
+    },
     thumbnails, timing,
     tray::refresh_tray_tooltip,
 };
@@ -94,6 +97,35 @@ pub(crate) fn switcher_snapshot() -> Option<SwitcherPayload> {
             .ok()
             .and_then(|state| payload_snapshot(&state))
     })
+}
+
+/// The mouse moved over a card: select it. The overlay stays where it is —
+/// only the selection highlight moves — and the new index is sent to every
+/// overlay, so keyboard cycling and the mouse stay in sync. Returns whether
+/// the selection changed.
+#[tauri::command]
+pub(crate) fn switcher_select(generation: u64, index: u32) -> bool {
+    let Some(runtime) = RUNTIME.get() else {
+        return false;
+    };
+    select_switcher(runtime, generation, index as usize)
+}
+
+/// The mouse clicked a card: commit that target immediately, even while the
+/// switcher's modifier is still held. The release that follows finds the
+/// session already closed (the hook's record of it is dropped on the way),
+/// so it cannot commit a second time. Returns whether it committed.
+#[tauri::command]
+pub(crate) fn switcher_click(generation: u64, index: u32) -> bool {
+    let Some(runtime) = RUNTIME.get() else {
+        return false;
+    };
+    commit_switcher(
+        runtime,
+        generation,
+        Some(index as usize),
+        std::time::Instant::now(),
+    )
 }
 
 /// Every setting the Settings window shows, keyed like `config.json`.

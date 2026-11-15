@@ -346,7 +346,7 @@ function buildView(payload: SwitcherPayload): View {
   }
 
   section.append(caption, items);
-  return {
+  const view: View = {
     key: payloadKey(payload),
     style: payload.card_style,
     layout: payload.layout,
@@ -358,6 +358,8 @@ function buildView(payload: SwitcherPayload): View {
     kbd,
     cards,
   };
+  cards.forEach((card, index) => attachCardMouse(view, card, index));
+  return view;
 }
 
 function updateView(view: View, payload: SwitcherPayload): void {
@@ -416,6 +418,28 @@ function markSelection(view: View, selected: number): void {
   } else {
     view.items.removeAttribute("aria-activedescendant");
   }
+}
+
+/** The overlay window never takes focus (WS_EX_NOACTIVATE), so the mouse can
+ * hover and click cards without Windows moving focus away from the app the
+ * user was on. Hovering a card selects it — like Windows' own Alt+Tab — and
+ * clicking one commits it immediately, even while the modifier is still
+ * held. The generation is echoed so a hover or click reported late (by an
+ * overlay that already closed) can never touch a newer session. */
+function attachCardMouse(view: View, card: CardView, index: number): void {
+  card.element.addEventListener("mouseenter", () => {
+    // Keyboard cycling keeps working; the mouse only takes over when it
+    // actually moves onto a different card.
+    if (card.element.classList.contains("selected")) return;
+    void invoke("switcher_select", { generation: view.generation, index }).catch(
+      (error: unknown) => console.warn("Unable to select from the mouse", error),
+    );
+  });
+  card.element.addEventListener("click", () => {
+    void invoke("switcher_click", { generation: view.generation, index }).catch(
+      (error: unknown) => console.warn("Unable to commit from the mouse", error),
+    );
+  });
 }
 
 // ---------------------------------------------------------------------------
