@@ -84,6 +84,22 @@ Notes:
 - It requires the **WebView2 runtime**, which is present by default on Windows 11. On older Windows 10 machines you may need to install the Evergreen runtime.
 - `npm run install:local` fails with a clear message if the release build is missing; run the build first.
 
+## Download
+
+Pre-built portable executables are attached to each [GitHub release](../../releases). Download `Window-Switcher-<version>-x64.exe` and run it; the `.sha256` file next to it lets you verify the download.
+
+## CI and releases
+
+- **CI** (`.github/workflows/ci.yml`) runs on every push and pull request: type check, Vitest, `cargo clippy` and `cargo test` on Windows.
+- **Release** (`.github/workflows/release.yml`) runs when a `v*` tag is pushed, or manually from the Actions tab. It runs the tests, builds the portable exe and publishes a GitHub release with the exe and its SHA-256.
+
+To cut a release:
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Configuration
 
 On first launch it creates:
