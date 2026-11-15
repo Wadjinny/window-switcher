@@ -40,6 +40,16 @@ impl Stopwatch {
         })
     }
 
+    /// Like `start`, but measured from `start`, e.g. when the keyboard hook
+    /// saw the key that another thread is now acting on.
+    pub fn start_at(label: &'static str, start: Instant) -> Option<Self> {
+        enabled().then(|| Self {
+            label,
+            start,
+            marks: Vec::with_capacity(8),
+        })
+    }
+
     pub fn start_instant(&self) -> Instant {
         self.start
     }

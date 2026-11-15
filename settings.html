@@ -7,89 +7,102 @@
   </head>
   <body>
     <main id="settings" class="settings">
-      <h1>Settings</h1>
+      <h1 class="visually-hidden">Settings</h1>
       <fieldset class="group">
         <legend>Shortcuts</legend>
-        <div class="option hotkey-row">
-          <span class="option-text">
-            <span class="option-title" id="app_hotkey-title">Switch apps</span>
-            <span class="option-detail">One card per app, most recent first.</span>
-            <span class="hotkey-error" id="app_hotkey-error" role="alert"></span>
-          </span>
-          <button type="button" class="hotkey" data-hotkey="app_hotkey"
-            aria-labelledby="app_hotkey-title" aria-describedby="app_hotkey-error"></button>
-        </div>
-        <div class="option hotkey-row">
-          <span class="option-text">
-            <span class="option-title" id="window_hotkey-title">Switch windows of current app</span>
-            <span class="option-detail">Cycles the focused app's own windows.</span>
-            <span class="hotkey-error" id="window_hotkey-error" role="alert"></span>
-          </span>
-          <button type="button" class="hotkey" data-hotkey="window_hotkey"
-            aria-labelledby="window_hotkey-title" aria-describedby="window_hotkey-error"></button>
+        <div class="card">
+          <div class="option hotkey-row">
+            <span class="option-text">
+              <span class="option-title" id="app_hotkey-title">Switch apps</span>
+              <span class="option-detail">One card per app, most recent first.</span>
+              <span class="hotkey-error" id="app_hotkey-error" role="alert"></span>
+            </span>
+            <!-- The accessible name is the title plus the button's own text,
+                 i.e. the current shortcut ("Switch apps Win + Tab"). -->
+            <button type="button" class="hotkey" id="app_hotkey-button" data-hotkey="app_hotkey"
+              aria-labelledby="app_hotkey-title app_hotkey-button"
+              aria-describedby="app_hotkey-error"></button>
+          </div>
+          <div class="option hotkey-row">
+            <span class="option-text">
+              <span class="option-title" id="window_hotkey-title">Switch windows of current app</span>
+              <span class="option-detail">Cycles the focused app's own windows.</span>
+              <span class="hotkey-error" id="window_hotkey-error" role="alert"></span>
+            </span>
+            <button type="button" class="hotkey" id="window_hotkey-button" data-hotkey="window_hotkey"
+              aria-labelledby="window_hotkey-title window_hotkey-button"
+              aria-describedby="window_hotkey-error"></button>
+          </div>
         </div>
         <div class="hotkey-footer">
           <span class="option-detail">Click a shortcut, then hold Alt or Win and press Tab or ` (the key above Tab). Esc cancels.</span>
           <button type="button" class="link-button" id="reset-hotkeys">Reset to defaults</button>
         </div>
+        <p class="visually-hidden" id="hotkey-live" aria-live="polite"></p>
       </fieldset>
       <fieldset class="group">
         <legend>Show switcher on</legend>
-        <label class="option">
-          <input type="radio" name="show_switcher_on" value="primary" />
-          <span class="option-text">
-            <span class="option-title">Primary monitor</span>
-            <span class="option-detail">Where Windows shows its own Alt+Tab.</span>
-          </span>
-        </label>
-        <label class="option">
-          <input type="radio" name="show_switcher_on" value="every" />
-          <span class="option-text">
-            <span class="option-title">Every monitor</span>
-            <span class="option-detail">A copy of the switcher on each screen.</span>
-          </span>
-        </label>
-        <label class="option">
-          <input type="radio" name="show_switcher_on" value="cursor" />
-          <span class="option-text">
-            <span class="option-title">Monitor with the mouse cursor</span>
-            <span class="option-detail">Follows the pointer from screen to screen.</span>
-          </span>
-        </label>
+        <div class="card">
+          <label class="option">
+            <input type="radio" name="show_switcher_on" value="primary" />
+            <span class="option-text">
+              <span class="option-title">Primary monitor</span>
+              <span class="option-detail">Where Windows shows its own Alt+Tab.</span>
+            </span>
+          </label>
+          <label class="option">
+            <input type="radio" name="show_switcher_on" value="every" />
+            <span class="option-text">
+              <span class="option-title">Every monitor</span>
+              <span class="option-detail">A copy of the switcher on each screen.</span>
+            </span>
+          </label>
+          <label class="option">
+            <input type="radio" name="show_switcher_on" value="cursor" />
+            <span class="option-text">
+              <span class="option-title">Monitor with the mouse cursor</span>
+              <span class="option-detail">Follows the pointer from screen to screen.</span>
+            </span>
+          </label>
+        </div>
       </fieldset>
       <fieldset class="group">
         <legend>Card style</legend>
-        <label class="option">
-          <input type="radio" name="card_style" value="icon" />
-          <span class="option-text">
-            <span class="option-title">App icon</span>
-            <span class="option-detail">Compact cards with the application's icon.</span>
-          </span>
-        </label>
-        <label class="option">
-          <input type="radio" name="card_style" value="preview" />
-          <span class="option-text">
-            <span class="option-title">Window preview</span>
-            <span class="option-detail">Live thumbnails of the windows, like Windows' Alt+Tab.</span>
-          </span>
-        </label>
+        <div class="card">
+          <label class="option">
+            <input type="radio" name="card_style" value="icon" />
+            <span class="option-text">
+              <span class="option-title">App icon</span>
+              <span class="option-detail">Compact cards with the application's icon.</span>
+            </span>
+          </label>
+          <label class="option">
+            <input type="radio" name="card_style" value="preview" />
+            <span class="option-text">
+              <span class="option-title">Window preview</span>
+              <span class="option-detail">Live thumbnails of the windows, like Windows' Alt+Tab.</span>
+            </span>
+          </label>
+        </div>
       </fieldset>
       <fieldset class="group">
         <legend>Layout</legend>
-        <label class="option">
-          <input type="radio" name="layout" value="horizontal" />
-          <span class="option-text">
-            <span class="option-title">Horizontal</span>
-            <span class="option-detail">Cards side by side, wrapping into rows.</span>
-          </span>
-        </label>
-        <label class="option">
-          <input type="radio" name="layout" value="vertical" />
-          <span class="option-text">
-            <span class="option-title">Vertical</span>
-            <span class="option-detail">A list of windows, one per row, with extra columns when it gets long.</span>
-          </span>
-        </label>
+        <div class="card">
+          <label class="option">
+            <input type="radio" name="layout" value="horizontal" />
+            <span class="option-text">
+              <span class="option-title">Horizontal</span>
+              <span class="option-detail">Cards side by side, wrapping into rows.</span>
+            </span>
+          </label>
+          <label class="option">
+            <input type="radio" name="layout" value="vertical" />
+            <span class="option-text">
+              <span class="option-title">Vertical</span>
+              <span class="option-detail">A list, one window per row, in more columns when long.</span>
+            </span>
+          </label>
+        </div>
       </fieldset>
       <p class="note" id="status" role="status">Changes apply and save immediately.</p>
     </main>

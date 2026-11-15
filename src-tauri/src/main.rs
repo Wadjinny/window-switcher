@@ -3,7 +3,7 @@
 mod timing;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     env,
     ffi::c_void,
     fs,
@@ -11,11 +11,11 @@ use std::{
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicU8, AtomicUsize, Ordering},
-        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+        mpsc, Arc, Mutex, MutexGuard, OnceLock,
     },
     thread,
-    time::Duration,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -74,13 +74,14 @@ use windows::{
                 BringWindowToTop, CallNextHookEx, DispatchMessageW, EnumWindows, GetClassLongPtrW,
                 GetCursorPos, GetForegroundWindow, GetIconInfo, GetMessageW, GetWindow,
                 GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-                GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, MessageBoxW,
-                SendMessageTimeoutW, SetForegroundWindow, SetWindowsHookExW, ShowWindow,
+                GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, KillTimer,
+                MessageBoxW, PeekMessageW, PostThreadMessageW, SendMessageTimeoutW,
+                SetForegroundWindow, SetTimer, SetWindowsHookExW, ShowWindowAsync,
                 TranslateMessage, UnhookWindowsHookEx, GCLP_HICON, GWL_EXSTYLE, GWL_STYLE,
                 GW_OWNER, HHOOK, HICON, ICONINFO, ICON_BIG, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN,
-                MB_ICONERROR, MB_OK, MSG, SMTO_ABORTIFHUNG, SW_RESTORE, WH_KEYBOARD_LL, WM_GETICON,
-                WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WS_CHILD, WS_EX_APPWINDOW,
-                WS_EX_TOOLWINDOW,
+                MB_ICONERROR, MB_OK, MSG, PM_NOREMOVE, SMTO_ABORTIFHUNG, SW_RESTORE, WH_KEYBOARD_LL,
+                WM_APP, WM_GETICON, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+                WS_CHILD, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
             },
         },
     },
@@ -265,12 +266,18 @@ struct Shortcut {
     scan_code: u32,
 }
 
-impl Shortcut {
-    fn matches(&self, vk: u32, scan_code: u32, alt_down: bool, win_down: bool) -> bool {
-        let modifier_down = match self.modifier {
+impl Modifier {
+    fn is_down(self, alt_down: bool, win_down: bool) -> bool {
+        match self {
             Modifier::Alt => alt_down,
             Modifier::Win => win_down,
-        };
+        }
+    }
+}
+
+impl Shortcut {
+    fn matches(&self, vk: u32, scan_code: u32, alt_down: bool, win_down: bool) -> bool {
+        let modifier_down = self.modifier.is_down(alt_down, win_down);
         // Matching the physical scan code keeps the shortcut working across
         // layouts: the US backtick and the French `²` key are both scancode 0x29.
         modifier_down
@@ -507,8 +514,18 @@ static THUMBNAILS: OnceLock<ThumbnailMap> = OnceLock::new();
 static OVERLAY_HWNDS: OnceLock<Mutex<HashMap<String, isize>>> = OnceLock::new();
 
 fn main() {
+    // `WINDOW_SWITCHER_DEBUG=1` adds debug lines (e.g. hotkey recording).
+    let debug = env::var_os("WINDOW_SWITCHER_DEBUG").is_some_and(|value| value != "0");
     let log_plugin = tauri_plugin_log::Builder::new()
         .level(log::LevelFilter::Info)
+        .level_for(
+            "window_switcher",
+            if debug {
+                log::LevelFilter::Debug
+            } else {
+                log::LevelFilter::Info
+            },
+        )
         .target(tauri_plugin_log::Target::new(
             tauri_plugin_log::TargetKind::LogDir {
                 file_name: Some("window-switcher".to_string()),
@@ -606,6 +623,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         state: Arc::new(Mutex::new(SwitcherState::default())),
     };
     let _ = RUNTIME.set(runtime);
+    // Read the timing flag now rather than on the first key press.
+    timing::enabled();
+    start_controller();
     install_keyboard_hook();
 
     if let Err(error) = install_tray(app) {
@@ -689,6 +709,19 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Set while the worker thread builds the Settings window, so a second quick
+/// click on "Settings…" does not start building another one.
+static SETTINGS_OPENING: AtomicBool = AtomicBool::new(false);
+
+/// Settings window size in logical pixels. The height is capped to the work
+/// area of the monitor it opens on; the content scrolls when it is shorter.
+const SETTINGS_WIDTH: f64 = 460.0;
+const SETTINGS_HEIGHT: f64 = 660.0;
+const SETTINGS_MIN_WIDTH: f64 = 400.0;
+const SETTINGS_MIN_HEIGHT: f64 = 320.0;
+/// Room kept for the title bar and some breathing space above and below.
+const SETTINGS_VERTICAL_MARGIN: f64 = 72.0;
+
 /// Shows the settings window, creating it on first use. Building a webview
 /// from the menu event handler (main thread) can deadlock on Windows, so a
 /// new window is built from a worker thread.
@@ -699,18 +732,31 @@ fn open_settings(app: &AppHandle) {
         let _ = window.set_focus();
         return;
     }
+    if SETTINGS_OPENING.swap(true, Ordering::SeqCst) {
+        // Already being built by an earlier click.
+        return;
+    }
     let app = app.clone();
     let spawned = thread::Builder::new()
         .name("switcher-settings".into())
         .spawn(move || {
+            // `center()` uses the monitor the window is created on; size it
+            // for the same one so it never extends past the work area.
+            let height = cursor_monitor_area()
+                .or_else(primary_monitor_area)
+                .map(|area| area.work.height as f64 / area.scale - SETTINGS_VERTICAL_MARGIN)
+                .map_or(SETTINGS_HEIGHT, |available| {
+                    SETTINGS_HEIGHT.min(available).max(SETTINGS_MIN_HEIGHT)
+                });
             let built = WebviewWindowBuilder::new(
                 &app,
                 SETTINGS_LABEL,
                 WebviewUrl::App("settings.html".into()),
             )
             .title("Window Switcher Settings")
-            .inner_size(440.0, 680.0)
-            .resizable(false)
+            .inner_size(SETTINGS_WIDTH, height)
+            .min_inner_size(SETTINGS_MIN_WIDTH, SETTINGS_MIN_HEIGHT)
+            .resizable(true)
             .maximizable(false)
             .minimizable(false)
             .center()
@@ -722,13 +768,17 @@ fn open_settings(app: &AppHandle) {
                 // Windows' foreground lock leaves a window created from this
                 // worker thread behind the active app; raise it explicitly.
                 Ok(window) => {
-                    window.on_window_event(|event| {
-                        if let WindowEvent::Destroyed = event {
-                            // Never leave the hook capturing keys for a
-                            // window that no longer exists.
+                    window.on_window_event(|event| match event {
+                        // Never leave the hook capturing keys for a window
+                        // that is in the background or no longer exists.
+                        WindowEvent::Focused(false) => {
+                            RECORDING_HOTKEY.store(false, Ordering::SeqCst);
+                        }
+                        WindowEvent::Destroyed => {
                             RECORDING_HOTKEY.store(false, Ordering::SeqCst);
                             SETTINGS_HWND.store(0, Ordering::SeqCst);
                         }
+                        _ => {}
                     });
                     if let Ok(hwnd) = window.hwnd() {
                         SETTINGS_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
@@ -737,8 +787,10 @@ fn open_settings(app: &AppHandle) {
                 }
                 Err(error) => log::error!("unable to open the settings window: {error}"),
             }
+            SETTINGS_OPENING.store(false, Ordering::SeqCst);
         });
     if let Err(error) = spawned {
+        SETTINGS_OPENING.store(false, Ordering::SeqCst);
         log::error!("unable to start the settings thread: {error}");
     }
 }
@@ -750,43 +802,123 @@ fn app_data_path() -> PathBuf {
     root.join("Window Switcher")
 }
 
-fn load_config() -> AppConfig {
-    let directory = app_data_path();
-    let file = directory.join("config.json");
+/// Serializes every read-modify-write of `config.json`. Setting commands are
+/// async, so two quick clicks can run at the same time; whoever holds this
+/// also updates the live setting, so the file and memory never disagree.
+static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
-    if !file.exists() {
-        let config = AppConfig::default();
-        if let Err(error) = fs::create_dir_all(&directory) {
-            log::warn!("unable to create {}: {error}", directory.display());
-            return config;
-        }
-        match serde_json::to_string_pretty(&config) {
-            Ok(contents) => {
-                if let Err(error) = fs::write(&file, contents) {
-                    log::warn!("unable to write {}: {error}", file.display());
-                }
+/// Proof that the caller holds `CONFIG_LOCK`.
+type ConfigLock = MutexGuard<'static, ()>;
+
+/// Locks a mutex that only orders work (it guards no data of its own), so a
+/// panic while it was held leaves nothing half-updated to worry about.
+fn lock_unpoisoned<T>(mutex: &'static Mutex<T>) -> MutexGuard<'static, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_config() -> ConfigLock {
+    lock_unpoisoned(&CONFIG_LOCK)
+}
+
+/// Saves `values`, then makes them live with `apply`, under the config lock:
+/// a failed save changes nothing, and two quick changes can never leave
+/// memory and the file holding different values.
+fn persist(values: &[(&str, String)], apply: impl FnOnce()) -> Result<(), String> {
+    let lock = lock_config();
+    save_config_values(&lock, values)?;
+    apply();
+    Ok(())
+}
+
+fn config_file() -> PathBuf {
+    app_data_path().join("config.json")
+}
+
+/// Writes `config.json` through a temporary file and a rename, so a crash or
+/// power loss mid-write leaves either the old or the new file, never half of one.
+fn write_config_file(_lock: &ConfigLock, root: &serde_json::Value) -> Result<(), String> {
+    let directory = app_data_path();
+    let file = config_file();
+    let temporary = directory.join("config.json.tmp");
+    let contents = serde_json::to_string_pretty(root).map_err(|error| error.to_string())?;
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("unable to create {}: {error}", directory.display()))?;
+    fs::write(&temporary, contents)
+        .map_err(|error| format!("unable to write {}: {error}", temporary.display()))?;
+    // On Windows `rename` replaces an existing file (MOVEFILE_REPLACE_EXISTING).
+    fs::rename(&temporary, &file).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!("unable to replace {}: {error}", file.display())
+    })
+}
+
+/// Takes each known setting from the file when it has the default's JSON
+/// type; a missing or wrong-typed one keeps its default, so one bad value
+/// never resets the others. Driven by `AppConfig` itself, so a new field
+/// needs no extra code here.
+fn config_from_object(object: &serde_json::Map<String, serde_json::Value>) -> AppConfig {
+    let Ok(serde_json::Value::Object(mut merged)) = serde_json::to_value(AppConfig::default())
+    else {
+        return AppConfig::default();
+    };
+    for (key, default) in merged.iter_mut() {
+        match object.get(key) {
+            Some(value) if std::mem::discriminant(value) == std::mem::discriminant(default) => {
+                *default = value.clone();
             }
-            Err(error) => log::warn!("unable to serialize the default config: {error}"),
+            Some(value) => {
+                log::warn!("config.json: {key} has the wrong type ({value}); using {default}")
+            }
+            None => {}
         }
-        return config;
     }
+    serde_json::from_value(serde_json::Value::Object(merged)).unwrap_or_default()
+}
+
+fn load_config() -> AppConfig {
+    let lock = lock_config();
+    let directory = app_data_path();
+    let file = config_file();
 
     let contents = match fs::read_to_string(&file) {
         Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let config = AppConfig::default();
+            match serde_json::to_value(&config) {
+                Ok(root) => {
+                    if let Err(error) = write_config_file(&lock, &root) {
+                        log::warn!("{error}");
+                    }
+                }
+                Err(error) => log::warn!("unable to serialize the default config: {error}"),
+            }
+            return config;
+        }
         Err(error) => {
             log::error!("unable to read {}: {error}; using defaults", file.display());
             return AppConfig::default();
         }
     };
 
-    match serde_json::from_str(&contents) {
-        Ok(config) => config,
-        Err(error) => {
+    match serde_json::from_str::<serde_json::Value>(&contents) {
+        Ok(serde_json::Value::Object(object)) => config_from_object(&object),
+        parsed => {
             // Never overwrite the file: keep the user's text for inspection and
-            // start from defaults so the hotkeys still work.
-            let invalid = directory.join("config.invalid.json");
+            // start from defaults so the hotkeys still work. The timestamp
+            // keeps an earlier backup from being replaced.
+            let reason = match parsed {
+                Err(error) => error.to_string(),
+                Ok(_) => "the top level is not an object".to_string(),
+            };
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or(0);
+            let invalid = directory.join(format!("config.invalid-{stamp}.json"));
             log::error!(
-                "{} is not a valid config ({error}); moving it to {}",
+                "{} is not a valid config ({reason}); moving it to {}",
                 file.display(),
                 invalid.display()
             );
@@ -798,37 +930,398 @@ fn load_config() -> AppConfig {
     }
 }
 
-/// Writes one key into `config.json`, keeping the rest of the file as the user
-/// left it (including keys this version does not know).
-fn save_config_value(key: &str, value: &str) -> Result<(), String> {
-    let directory = app_data_path();
-    let file = directory.join("config.json");
-    let mut root = fs::read_to_string(&file)
-        .ok()
-        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-        .filter(|value| value.is_object())
-        .unwrap_or_else(|| {
-            serde_json::to_value(AppConfig::default()).unwrap_or(serde_json::json!({}))
-        });
+/// Writes keys into `config.json`, keeping the rest of the file as the user
+/// left it (including keys this version does not know). All values land in
+/// one write. A file that exists but cannot be parsed is left untouched and
+/// the save fails, rather than replacing the user's text with defaults.
+fn save_config_values(lock: &ConfigLock, values: &[(&str, String)]) -> Result<(), String> {
+    let file = config_file();
+    let mut root = match fs::read_to_string(&file) {
+        Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
+            Ok(value) if value.is_object() => value,
+            _ => {
+                return Err(format!(
+                    "{} is not valid JSON; fix or delete it, then try again",
+                    file.display()
+                ))
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::to_value(AppConfig::default()).map_err(|error| error.to_string())?
+        }
+        Err(error) => return Err(format!("unable to read {}: {error}", file.display())),
+    };
     if let Some(object) = root.as_object_mut() {
-        object.insert(
-            key.to_string(),
-            serde_json::Value::String(value.to_string()),
-        );
+        for (key, value) in values {
+            object.insert(key.to_string(), serde_json::Value::String(value.clone()));
+        }
     }
-    let contents = serde_json::to_string_pretty(&root).map_err(|error| error.to_string())?;
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("unable to create {}: {error}", directory.display()))?;
-    fs::write(&file, contents)
-        .map_err(|error| format!("unable to write {}: {error}", file.display()))
+    write_config_file(lock, &root)
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard hook and switcher controller
+// ---------------------------------------------------------------------------
+//
+// While a low-level keyboard hook runs, keyboard input for the whole session
+// waits for it, and Windows silently removes a hook that takes longer than
+// `LowLevelHooksTimeout`. So the hook (`keyboard_hook`) only makes a pure,
+// in-memory decision (`decide_key`): swallow or pass the key, and which
+// `Command` to post. Everything slow (enumerating windows, COM, building the
+// payload, emitting events, showing and hiding overlays, activating windows)
+// runs in order on the controller thread (`run_controller`).
+//
+// The hook owns the "is a switcher session open" bit (`HOOK_SESSION`), so it
+// can decide the next key without waiting for the controller. The controller
+// clears that bit (compare-and-swap on the generation) when it closes a
+// session on its own: no targets, or the watchdog found the modifier up.
+
+/// Which switcher a session belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwitchMode {
+    Window,
+    App,
+}
+
+impl SwitchMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Window => MODE_WINDOW,
+            Self::App => MODE_APP,
+        }
+    }
+
+    fn bits(self) -> u64 {
+        match self {
+            Self::Window => 1,
+            Self::App => 2,
+        }
+    }
+}
+
+/// The open session as the hook sees it: `(generation << 2) | mode bits`, or
+/// 0 when no switcher is open. Written by the hook; the controller only ever
+/// clears it, and only for the generation it is closing.
+static HOOK_SESSION: AtomicU64 = AtomicU64::new(0);
+
+fn hook_session() -> Option<(u64, SwitchMode)> {
+    let packed = HOOK_SESSION.load(Ordering::SeqCst);
+    let mode = match packed & 3 {
+        1 => SwitchMode::Window,
+        2 => SwitchMode::App,
+        _ => return None,
+    };
+    Some((packed >> 2, mode))
+}
+
+fn set_hook_session(generation: u64, mode: SwitchMode) {
+    HOOK_SESSION.store((generation << 2) | mode.bits(), Ordering::SeqCst);
+}
+
+/// Closes the hook's session if it is still `generation`. Returns false when
+/// the hook already closed or replaced it (its own command is then queued).
+fn close_hook_session(generation: u64) -> bool {
+    let current = HOOK_SESSION.load(Ordering::SeqCst);
+    current != 0
+        && current >> 2 == generation
+        && HOOK_SESSION
+            .compare_exchange(current, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+}
+
+/// Number of app cards Win+Tab would show, kept fresh by the controller. The
+/// hook reads it to decide whether to swallow the app shortcut (with fewer
+/// than two apps, Win+Tab falls through to Task View). It is a hint: when it
+/// is stale the controller replays the shortcut (see `replay_shortcut`).
+static APP_TARGETS_HINT: AtomicUsize = AtomicUsize::new(2);
+
+/// What the foreground window is, for the swallow decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Foreground {
+    /// No foreground window (e.g. during a desktop switch).
+    None,
+    /// One of ours (Settings): the switcher works relative to the last app.
+    Own,
+    Other,
+}
+
+/// Everything the hook decision needs, read from the key event and memory.
+#[derive(Clone, Copy, Debug)]
+struct KeyInput {
+    vk: u32,
+    scan_code: u32,
+    down: bool,
+    alt: bool,
+    win: bool,
+    shift: bool,
+    /// The open session's mode, if any.
+    session: Option<SwitchMode>,
+    /// Settings is in front and one of its hotkey fields is recording.
+    recording: bool,
+    foreground: Foreground,
+    app_targets: usize,
+    window_shortcut: Shortcut,
+    app_shortcut: Shortcut,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Action {
+    PassThrough,
+    Open { mode: SwitchMode, reverse: bool },
+    Advance { reverse: bool },
+    Commit,
+    Cancel,
+    RecordKey,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Decision {
+    /// The open session's modifier is no longer held (its release was lost,
+    /// e.g. to the secure desktop): close it before acting on this key.
+    close_stale: bool,
+    action: Action,
+    /// Swallow the key instead of passing it on.
+    swallow: bool,
+    /// Inject the mask key (see `send_mask_key`) before returning.
+    mask: bool,
+}
+
+impl Decision {
+    const PASS: Self = Self {
+        close_stale: false,
+        action: Action::PassThrough,
+        swallow: false,
+        mask: false,
+    };
+}
+
+impl KeyInput {
+    fn shortcut(&self, mode: SwitchMode) -> Shortcut {
+        match mode {
+            SwitchMode::Window => self.window_shortcut,
+            SwitchMode::App => self.app_shortcut,
+        }
+    }
+
+    /// Whether pressing `mode`'s shortcut now opens a switcher. The window
+    /// switcher opens even for a single window (releasing just re-activates
+    /// it); the app switcher needs two apps, or one when Settings is in
+    /// front. An empty result is handled by the controller.
+    fn opens(&self, mode: SwitchMode) -> bool {
+        match (self.foreground, mode) {
+            (Foreground::None, _) => false,
+            (_, SwitchMode::Window) => true,
+            (Foreground::Own, SwitchMode::App) => self.app_targets >= 1,
+            (Foreground::Other, SwitchMode::App) => self.app_targets >= 2,
+        }
+    }
+}
+
+fn is_release_of(modifier: Modifier, vk: u32) -> bool {
+    match modifier {
+        Modifier::Alt => {
+            vk == VK_LMENU.0 as u32 || vk == VK_RMENU.0 as u32 || vk == VK_MENU.0 as u32
+        }
+        Modifier::Win => vk == VK_LWIN.0 as u32 || vk == VK_RWIN.0 as u32,
+    }
+}
+
+/// The hook's whole decision for one key event. Pure, so it is unit tested.
+fn decide_key(input: &KeyInput) -> Decision {
+    if input.recording {
+        // A Settings field is recording a new shortcut: hand it the
+        // combination instead of acting on it, so neither the current hotkeys
+        // nor Windows' own Win+Tab / Alt+Tab fire while the user types it.
+        // Modifiers pass through so the webview and the shell stay in sync.
+        if input.down && !is_modifier_key(input.vk) {
+            return Decision {
+                action: Action::RecordKey,
+                swallow: true,
+                mask: input.alt || input.win,
+                ..Decision::PASS
+            };
+        }
+        return Decision::PASS;
+    }
+
+    // A modifier release can go missing, e.g. when Ctrl+Alt+Del or a UAC
+    // prompt switches to the secure desktop mid-switch. Any key event with
+    // the mode's modifier no longer held closes the session. The release
+    // itself still reports the key as down here, so it commits normally.
+    let mut session = input.session;
+    let mut close_stale = false;
+    if let Some(mode) = session {
+        if !input.shortcut(mode).modifier.is_down(input.alt, input.win) {
+            session = None;
+            close_stale = true;
+        }
+    }
+    let pass = Decision {
+        close_stale,
+        ..Decision::PASS
+    };
+
+    if !input.down {
+        // Do not swallow the modifier release: Windows would keep the key
+        // logically held, which breaks normal typing afterwards.
+        return match session {
+            Some(mode) if is_release_of(input.shortcut(mode).modifier, input.vk) => Decision {
+                action: Action::Commit,
+                ..pass
+            },
+            _ => pass,
+        };
+    }
+
+    if session.is_some() && input.vk == VK_ESCAPE.0 as u32 {
+        return Decision {
+            action: Action::Cancel,
+            swallow: true,
+            mask: input.alt || input.win,
+            ..pass
+        };
+    }
+    let matches = |mode: SwitchMode| {
+        input
+            .shortcut(mode)
+            .matches(input.vk, input.scan_code, input.alt, input.win)
+    };
+    if let Some(mode) = session {
+        if matches(mode) {
+            return Decision {
+                action: Action::Advance {
+                    reverse: input.shift,
+                },
+                swallow: true,
+                mask: true,
+                ..pass
+            };
+        }
+    }
+    // The window shortcut wins if both ever match the same key.
+    let mode = if matches(SwitchMode::Window) {
+        SwitchMode::Window
+    } else if matches(SwitchMode::App) {
+        SwitchMode::App
+    } else {
+        return pass;
+    };
+    // Only swallow the key when a switcher opens. Otherwise let Windows
+    // handle it, so Win+Tab still opens Task View when there is nothing to
+    // switch between.
+    if !input.opens(mode) {
+        return pass;
+    }
+    Decision {
+        action: Action::Open {
+            mode,
+            reverse: input.shift,
+        },
+        swallow: true,
+        mask: true,
+        ..pass
+    }
+}
+
+/// Work for the controller thread, posted by the hook (and a few others).
+enum Command {
+    Open {
+        mode: SwitchMode,
+        reverse: bool,
+        generation: u64,
+        /// The swallowed key, replayed if nothing opens.
+        vk: u32,
+        scan_code: u32,
+        /// When the hook saw the key, for the latency log.
+        at: Instant,
+    },
+    Advance {
+        generation: u64,
+        reverse: bool,
+        at: Instant,
+    },
+    Commit {
+        generation: u64,
+        at: Instant,
+    },
+    Cancel {
+        generation: u64,
+        reason: &'static str,
+    },
+    RecordKey(RecordedKey),
+    /// Show the open switcher again (new overlays were created).
+    Reshow,
+}
+
+/// The raw key captured while recording; named on the controller thread.
+#[derive(Clone, Copy)]
+struct RecordedKey {
+    vk: u32,
+    scan_code: u32,
+    extended: bool,
+    alt: bool,
+    win: bool,
+    ctrl: bool,
+    shift: bool,
+}
+
+/// Wakes the controller's message loop; the commands wait in the channel.
+const WM_CONTROLLER_WAKE: u32 = WM_APP + 1;
+/// Posted by the hook procedure to its own thread: send the mask key right
+/// after the hook returns (see `queue_mask_key`).
+const WM_HOOK_SEND_MASK: u32 = WM_APP + 2;
+/// The hook thread's id, for `WM_HOOK_SEND_MASK`.
+static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+
+struct ControllerHandle {
+    sender: Mutex<mpsc::Sender<Command>>,
+    thread_id: AtomicU32,
+}
+
+static CONTROLLER: OnceLock<ControllerHandle> = OnceLock::new();
+
+/// Queues `command` for the controller thread. Never blocks for long: the
+/// sender lock is only held for the channel push.
+fn post_command(command: Command) {
+    let Some(controller) = CONTROLLER.get() else {
+        return;
+    };
+    let sent = lock_unpoisoned(&controller.sender).send(command).is_ok();
+    let thread_id = controller.thread_id.load(Ordering::SeqCst);
+    if sent && thread_id != 0 {
+        unsafe {
+            let _ = PostThreadMessageW(thread_id, WM_CONTROLLER_WAKE, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// How often the hook thread considers reinstalling the hook, and how long
+/// a hook lives before it is reinstalled at the next quiet moment.
+const REHOOK_CHECK_MS: u32 = 5_000;
+const REHOOK_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+/// No key event for this long counts as a quiet moment.
+const REHOOK_QUIET: std::time::Duration = std::time::Duration::from_secs(1);
+/// Set on exit so the hook thread does not reinstall a removed hook.
+static HOOK_EXITING: AtomicBool = AtomicBool::new(false);
+/// Microseconds since `process_start()` of the last key event the hook saw.
+static LAST_KEY_EVENT_US: AtomicU64 = AtomicU64::new(0);
+
+fn process_start() -> Instant {
+    static START: OnceLock<Instant> = OnceLock::new();
+    *START.get_or_init(Instant::now)
+}
+
+fn micros_since_start() -> u64 {
+    process_start().elapsed().as_micros() as u64
 }
 
 fn install_keyboard_hook() {
+    process_start();
     let spawned = thread::Builder::new()
         .name("switcher-hook".into())
         .spawn(|| unsafe {
-            // The window identity helpers below use shell COM APIs.
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            // This thread only runs the hook, so it is always free to take
+            // the next key event; no COM or window work happens here.
             let hook = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0) {
                 Ok(hook) => hook,
                 Err(error) => {
@@ -841,13 +1334,29 @@ fn install_keyboard_hook() {
             };
             log::info!("keyboard hook installed");
             HOOK_HANDLE.store(hook.0 as usize, Ordering::SeqCst);
+            HOOK_THREAD_ID.store(GetCurrentThreadId(), Ordering::SeqCst);
+            let mut installed_at = Instant::now();
+            let rehook_timer = SetTimer(None, 0, REHOOK_CHECK_MS, None);
             let mut message = MSG::default();
             while GetMessageW(&mut message, None, 0, 0).as_bool() {
+                if message.hwnd.0.is_null() && message.message == WM_HOOK_SEND_MASK {
+                    send_mask_key();
+                    continue;
+                }
+                if message.hwnd.0.is_null()
+                    && message.message == WM_TIMER
+                    && message.wParam.0 == rehook_timer
+                {
+                    if installed_at.elapsed() >= REHOOK_AFTER && hook_is_quiet() {
+                        reinstall_keyboard_hook();
+                        installed_at = Instant::now();
+                    }
+                    continue;
+                }
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
-            let _ = UnhookWindowsHookEx(hook);
-            HOOK_HANDLE.store(0, Ordering::SeqCst);
+            remove_keyboard_hook();
         });
 
     if let Err(error) = spawned {
@@ -858,7 +1367,63 @@ fn install_keyboard_hook() {
     }
 }
 
+/// No switcher open, nothing recording, no modifier held and no key event
+/// for a moment: reinstalling the hook now cannot split a key sequence.
+fn hook_is_quiet() -> bool {
+    let idle_us = micros_since_start().saturating_sub(LAST_KEY_EVENT_US.load(Ordering::SeqCst));
+    HOOK_SESSION.load(Ordering::SeqCst) == 0
+        && !RECORDING_HOTKEY.load(Ordering::SeqCst)
+        && idle_us >= REHOOK_QUIET.as_micros() as u64
+        && !alt_key_down()
+        && !win_key_down()
+        && !unsafe { key_is_down(VK_CONTROL.0 as i32) || key_is_down(VK_SHIFT.0 as i32) }
+}
+
+/// Windows removes a low-level hook without notice when one call exceeds
+/// `LowLevelHooksTimeout` (a stall elsewhere in the system can cause it, not
+/// only a slow hook), and there is no API to ask whether a hook is still
+/// installed. So the hook thread periodically installs a fresh hook and then
+/// removes the old one. Both calls run on this thread, which also runs the
+/// hook procedure, so no key event is handled between them: there is never a
+/// moment without a hook, and no event is seen twice.
+fn reinstall_keyboard_hook() {
+    if HOOK_EXITING.load(Ordering::SeqCst) {
+        return;
+    }
+    match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0) } {
+        Ok(hook) => {
+            let old = HOOK_HANDLE.swap(hook.0 as usize, Ordering::SeqCst);
+            if old != 0 {
+                unsafe {
+                    let _ = UnhookWindowsHookEx(HHOOK(old as *mut c_void));
+                }
+            }
+            log::debug!("keyboard hook reinstalled");
+        }
+        Err(error) => log::warn!("unable to reinstall the keyboard hook: {error}"),
+    }
+}
+
+/// The window the switcher works relative to: the foreground window, or,
+/// when one of ours (Settings) is in front, the topmost other app's window,
+/// i.e. the one the user came from (our windows are never switch targets).
+/// The flag says that window is not focused, so its card is a real move.
+fn switch_origin() -> Option<(HWND, bool)> {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.0.is_null() {
+        return None;
+    }
+    if !is_own_window(foreground) {
+        return Some((foreground, false));
+    }
+    eligible_windows()
+        .into_iter()
+        .next()
+        .map(|target| (target.hwnd, true))
+}
+
 fn remove_keyboard_hook() {
+    HOOK_EXITING.store(true, Ordering::SeqCst);
     let raw = HOOK_HANDLE.swap(0, Ordering::SeqCst);
     if raw != 0 {
         unsafe {
@@ -867,104 +1432,171 @@ fn remove_keyboard_hook() {
     }
 }
 
-unsafe extern "system" fn keyboard_hook(code: i32, message: WPARAM, data: LPARAM) -> LRESULT {
-    if code < 0 {
-        return CallNextHookEx(None, code, message, data);
-    }
-    let Some(runtime) = RUNTIME.get() else {
-        return CallNextHookEx(None, code, message, data);
-    };
-    let key = *(data.0 as *const KBDLLHOOKSTRUCT);
-    if key.dwExtraInfo == MASK_KEY_TAG {
-        // Our own mask key (see `send_mask_key`): never treat it as a hotkey.
-        return CallNextHookEx(None, code, message, data);
-    }
-    let vk = key.vkCode;
-    let message = message.0 as u32;
-    let alt_down = key.flags.0 & LLKHF_ALTDOWN.0 != 0
-        || key_is_down(VK_LMENU.0 as i32)
-        || key_is_down(VK_RMENU.0 as i32);
-    let win_down = key_is_down(VK_LWIN.0 as i32) || key_is_down(VK_RWIN.0 as i32);
-    let shift_down = key_is_down(VK_SHIFT.0 as i32)
-        || key_is_down(VK_LSHIFT.0 as i32)
-        || key_is_down(VK_RSHIFT.0 as i32);
+/// Hook procedure timing (only with `WINDOW_SWITCHER_TIMING=1`), logged and
+/// reset by the controller after each switch.
+static HOOK_CALLS: AtomicU64 = AtomicU64::new(0);
+static HOOK_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static HOOK_MAX_NS: AtomicU64 = AtomicU64::new(0);
 
-    if RECORDING_HOTKEY.load(Ordering::SeqCst) && settings_is_foreground() {
-        // A Settings field is recording a new shortcut: hand it the
-        // combination instead of acting on it, so neither the current hotkeys
-        // nor Windows' own Win+Tab / Alt+Tab fire while the user types it.
-        // Modifiers pass through so the webview and the shell stay in sync.
-        if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN) && !is_modifier_key(vk) {
-            if alt_down || win_down {
-                send_mask_key();
-            }
-            let ctrl_down = key_is_down(VK_CONTROL.0 as i32);
-            emit_recorded_hotkey(runtime, &key, alt_down, win_down, ctrl_down, shift_down);
+unsafe extern "system" fn keyboard_hook(code: i32, message: WPARAM, data: LPARAM) -> LRESULT {
+    if code >= 0 {
+        let started = Instant::now();
+        // A panic must never unwind into Windows (that aborts the process):
+        // on a panic the key simply passes through.
+        let swallow = std::panic::catch_unwind(|| {
+            let key = *(data.0 as *const KBDLLHOOKSTRUCT);
+            handle_key_event(&key, message.0 as u32, started)
+        })
+        .unwrap_or_else(|_| {
+            log::error!("the keyboard hook panicked; the key was passed through");
+            false
+        });
+        if timing::enabled() {
+            let elapsed = started.elapsed().as_nanos() as u64;
+            HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
+            HOOK_TOTAL_NS.fetch_add(elapsed, Ordering::Relaxed);
+            HOOK_MAX_NS.fetch_max(elapsed, Ordering::Relaxed);
+        }
+        if swallow {
             return LRESULT(1);
         }
-        return CallNextHookEx(None, code, WPARAM(message as usize), data);
     }
+    CallNextHookEx(None, code, message, data)
+}
 
-    match message {
-        WM_KEYDOWN | WM_SYSKEYDOWN => {
-            if vk == VK_ESCAPE.0 as u32 && cancel_switcher(runtime) {
-                if alt_down || win_down {
-                    send_mask_key();
-                }
-                return LRESULT(1);
-            }
-            let already_open = runtime
-                .state
-                .lock()
-                .ok()
-                .and_then(|state| state.active.clone());
-            if let Some(active) = already_open {
-                let shortcut = shortcut_for(&active.mode);
-                if shortcut.matches(vk, key.scanCode, alt_down, win_down) {
-                    send_mask_key();
-                    advance_switcher(runtime, shift_down);
-                    return LRESULT(1);
-                }
-            }
-            // Only swallow the key when the overlay actually opened. Otherwise
-            // let Windows handle it, so Win+Tab still opens Task View when
-            // there is nothing to switch between.
-            let opened = if window_shortcut().matches(vk, key.scanCode, alt_down, win_down) {
-                open_switcher(runtime, MODE_WINDOW, shift_down)
-            } else if app_shortcut().matches(vk, key.scanCode, alt_down, win_down) {
-                open_switcher(runtime, MODE_APP, shift_down)
-            } else {
-                false
-            };
-            if opened {
-                send_mask_key();
-                return LRESULT(1);
-            }
-        }
-        WM_KEYUP | WM_SYSKEYUP => {
-            let release_alt = vk == VK_LMENU.0 as u32 || vk == VK_RMENU.0 as u32;
-            let release_win = vk == VK_LWIN.0 as u32 || vk == VK_RWIN.0 as u32;
-            let should_activate = runtime
-                .state
-                .lock()
-                .ok()
-                .and_then(|state| {
-                    state.active.as_ref().map(|active| {
-                        (active.mode == MODE_WINDOW && release_alt)
-                            || (active.mode == MODE_APP && release_win)
-                    })
-                })
-                .unwrap_or(false);
-            if should_activate {
-                commit_switcher(runtime);
-                // Do not swallow the modifier release: Windows would keep the
-                // key logically held, which breaks normal typing afterwards.
-                // Fall through so the key-up reaches the shell.
-            }
-        }
-        _ => {}
+/// Reads the inputs for `decide_key`, applies its decision (session bit,
+/// mask key, command) and returns whether to swallow the key. Only atomics,
+/// `GetAsyncKeyState`, `GetForegroundWindow` and a channel push: no locks
+/// that other threads hold for long, no COM, no window messages.
+fn handle_key_event(key: &KBDLLHOOKSTRUCT, message: u32, at: Instant) -> bool {
+    if key.dwExtraInfo == MASK_KEY_TAG {
+        // Our own mask key or replayed shortcut: never treat it as a hotkey.
+        return false;
     }
-    CallNextHookEx(None, code, WPARAM(message as usize), data)
+    LAST_KEY_EVENT_US.store(micros_since_start(), Ordering::SeqCst);
+    let down = match message {
+        WM_KEYDOWN | WM_SYSKEYDOWN => true,
+        WM_KEYUP | WM_SYSKEYUP => false,
+        _ => return false,
+    };
+    let alt = key.flags.0 & LLKHF_ALTDOWN.0 != 0 || alt_key_down();
+    let win = win_key_down();
+    let shift = unsafe {
+        key_is_down(VK_SHIFT.0 as i32)
+            || key_is_down(VK_LSHIFT.0 as i32)
+            || key_is_down(VK_RSHIFT.0 as i32)
+    };
+    let session = hook_session();
+    let foreground = unsafe { GetForegroundWindow() };
+    let input = KeyInput {
+        vk: key.vkCode,
+        scan_code: key.scanCode,
+        down,
+        alt,
+        win,
+        shift,
+        session: session.map(|(_, mode)| mode),
+        recording: RECORDING_HOTKEY.load(Ordering::SeqCst) && settings_is_foreground(),
+        foreground: if foreground.0.is_null() {
+            Foreground::None
+        } else if is_own_window(foreground) {
+            Foreground::Own
+        } else {
+            Foreground::Other
+        },
+        app_targets: APP_TARGETS_HINT.load(Ordering::SeqCst),
+        window_shortcut: window_shortcut(),
+        app_shortcut: app_shortcut(),
+    };
+    let decision = decide_key(&input);
+
+    if decision.close_stale {
+        if let Some((generation, _)) = session {
+            if close_hook_session(generation) {
+                post_command(Command::Cancel {
+                    generation,
+                    reason: "switcher modifier is no longer held",
+                });
+            }
+        }
+    }
+    match decision.action {
+        Action::PassThrough => {}
+        Action::Open { mode, reverse } => {
+            let generation = SWITCHER_GENERATION
+                .fetch_add(1, Ordering::SeqCst)
+                .wrapping_add(1);
+            set_hook_session(generation, mode);
+            post_command(Command::Open {
+                mode,
+                reverse,
+                generation,
+                vk: key.vkCode,
+                scan_code: key.scanCode,
+                at,
+            });
+        }
+        Action::Advance { reverse } => {
+            if let Some((generation, _)) = session {
+                post_command(Command::Advance {
+                    generation,
+                    reverse,
+                    at,
+                });
+            }
+        }
+        Action::Commit => {
+            if let Some((generation, _)) = session {
+                if close_hook_session(generation) {
+                    post_command(Command::Commit { generation, at });
+                }
+            }
+        }
+        Action::Cancel => {
+            if let Some((generation, _)) = session {
+                if close_hook_session(generation) {
+                    post_command(Command::Cancel {
+                        generation,
+                        reason: "Escape",
+                    });
+                }
+            }
+        }
+        Action::RecordKey => {
+            const LLKHF_EXTENDED: u32 = 0x01;
+            post_command(Command::RecordKey(RecordedKey {
+                vk: key.vkCode,
+                scan_code: key.scanCode,
+                extended: key.flags.0 & LLKHF_EXTENDED != 0,
+                alt,
+                win,
+                ctrl: unsafe { key_is_down(VK_CONTROL.0 as i32) },
+                shift,
+            }));
+        }
+    }
+    // After the command, so the controller starts on it first.
+    if decision.mask {
+        queue_mask_key();
+    }
+    decision.swallow
+}
+
+/// Sends the mask key from the hook thread as soon as the hook procedure
+/// returns. `SendInput` called inside the hook procedure itself takes about
+/// 2 ms (the input system is busy waiting for this very hook), which would
+/// make every swallowed key that slow. The message is handled within
+/// microseconds, while the modifier is still physically held, and injected
+/// input is appended to the input queue either way, so the order of events
+/// is the same as sending it inline.
+fn queue_mask_key() {
+    let thread_id = HOOK_THREAD_ID.load(Ordering::SeqCst);
+    let posted = thread_id != 0
+        && unsafe { PostThreadMessageW(thread_id, WM_HOOK_SEND_MASK, WPARAM(0), LPARAM(0)) }
+            .is_ok();
+    if !posted {
+        send_mask_key();
+    }
 }
 
 /// `dwExtraInfo` stamped on the mask key so the hook can recognise it.
@@ -972,6 +1604,30 @@ const MASK_KEY_TAG: usize = 0x5753_4D4B; // "WSMK"
 /// Unassigned virtual key (the same one AutoHotkey recommends as its menu
 /// mask key): no application or shell shortcut reacts to it.
 const MASK_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0xE8);
+
+fn tagged_key(vk: u16, scan_code: u16, up: bool) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk),
+                wScan: scan_code,
+                dwFlags: if up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    KEYBD_EVENT_FLAGS(0)
+                },
+                time: 0,
+                dwExtraInfo: MASK_KEY_TAG,
+            },
+        },
+    }
+}
+
+fn send_tagged(inputs: &[INPUT]) -> bool {
+    let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
+    sent == inputs.len() as u32
+}
 
 /// The hook swallows the hotkey's second key (Tab, backtick, Escape), so the
 /// shell only sees the modifier go down and come back up with nothing in
@@ -981,25 +1637,39 @@ const MASK_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0xE8);
 /// was used, so the release does nothing. Must be called while the modifier
 /// is down, i.e. from the key-down that is being swallowed.
 fn send_mask_key() {
-    let event = |flags: KEYBD_EVENT_FLAGS| INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: MASK_KEY,
-                wScan: 0,
-                dwFlags: flags,
-                time: 0,
-                dwExtraInfo: MASK_KEY_TAG,
-            },
-        },
+    let inputs = [
+        tagged_key(MASK_KEY.0, 0, false),
+        tagged_key(MASK_KEY.0, 0, true),
+    ];
+    if !send_tagged(&inputs) {
+        log::warn!("unable to send the mask key");
+    }
+}
+
+/// The hook swallowed a shortcut (from a stale hint) but there turned out to
+/// be nothing to switch to: send it on to Windows after all, so Win+Tab still
+/// opens Task View. Tagged, so our hook lets it through. If the modifier was
+/// already released, the whole combination is replayed.
+fn replay_shortcut(modifier: Modifier, vk: u32, scan_code: u32) {
+    let (vk, scan) = (vk as u16, scan_code as u16);
+    let key = [tagged_key(vk, scan, false), tagged_key(vk, scan, true)];
+    let held = modifier.is_down(alt_key_down(), win_key_down());
+    let sent = if held {
+        send_tagged(&key)
+    } else {
+        let modifier_vk = match modifier {
+            Modifier::Alt => VK_LMENU.0,
+            Modifier::Win => VK_LWIN.0,
+        };
+        send_tagged(&[
+            tagged_key(modifier_vk, 0, false),
+            key[0],
+            key[1],
+            tagged_key(modifier_vk, 0, true),
+        ])
     };
-    let inputs = [event(KEYBD_EVENT_FLAGS(0)), event(KEYEVENTF_KEYUP)];
-    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if sent != inputs.len() as u32 {
-        log::warn!(
-            "unable to send the mask key ({sent} of {} events)",
-            inputs.len()
-        );
+    if !sent {
+        log::warn!("unable to replay the shortcut");
     }
 }
 
@@ -1017,6 +1687,26 @@ fn settings_is_foreground() -> bool {
     let settings = SETTINGS_HWND.load(Ordering::SeqCst);
     settings != 0 && unsafe { GetForegroundWindow() }.0 as isize == settings
 }
+
+fn alt_key_down() -> bool {
+    unsafe { key_is_down(VK_LMENU.0 as i32) || key_is_down(VK_RMENU.0 as i32) }
+}
+
+fn win_key_down() -> bool {
+    unsafe { key_is_down(VK_LWIN.0 as i32) || key_is_down(VK_RWIN.0 as i32) }
+}
+
+/// Generation and mode of the open switcher, if any.
+fn active_switcher(runtime: &HookRuntime) -> Option<(u64, String)> {
+    let state = runtime.state.lock().ok()?;
+    let active = state.active.as_ref()?;
+    Some((active.generation, active.mode.clone()))
+}
+
+/// How often the watchdog checks that the switcher's modifier is still held.
+const WATCHDOG_INTERVAL_MS: u32 = 200;
+/// How often the controller recounts the apps for `APP_TARGETS_HINT`.
+const APP_HINT_INTERVAL_MS: u32 = 2_000;
 
 fn is_modifier_key(vk: u32) -> bool {
     [
@@ -1051,28 +1741,28 @@ struct RecordedHotkey {
     key_name: String,
 }
 
-fn emit_recorded_hotkey(
-    runtime: &HookRuntime,
-    key: &KBDLLHOOKSTRUCT,
-    alt: bool,
-    win: bool,
-    ctrl: bool,
-    shift: bool,
-) {
+fn emit_recorded_hotkey(runtime: &HookRuntime, key: &RecordedKey) {
+    log::debug!(
+        "recording: vk={:#x} scan={:#x} alt={} win={}",
+        key.vk,
+        key.scan_code,
+        key.alt,
+        key.win
+    );
     // Same physical-key rule as `Shortcut::matches`.
-    let name = if key.vkCode == VK_TAB.0 as u32 || key.scanCode == 0x0F {
+    let name = if key.vk == VK_TAB.0 as u32 || key.scan_code == 0x0F {
         Some("Tab")
-    } else if key.vkCode == VK_OEM_3.0 as u32 || key.scanCode == 0x29 {
+    } else if key.vk == VK_OEM_3.0 as u32 || key.scan_code == 0x29 {
         Some("Backtick")
     } else {
         None
     };
     let recorded = RecordedHotkey {
-        alt,
-        win,
-        ctrl,
-        shift,
-        escape: key.vkCode == VK_ESCAPE.0 as u32,
+        alt: key.alt,
+        win: key.win,
+        ctrl: key.ctrl,
+        shift: key.shift,
+        escape: key.vk == VK_ESCAPE.0 as u32,
         key: name.map(str::to_string),
         key_name: key_name(key),
     };
@@ -1085,10 +1775,9 @@ fn emit_recorded_hotkey(
 }
 
 /// The key's name in the current layout ("Q", "F5", "Page Down").
-fn key_name(key: &KBDLLHOOKSTRUCT) -> String {
-    const LLKHF_EXTENDED: u32 = 0x01;
-    let mut lparam = ((key.scanCode & 0xFF) as i32) << 16;
-    if key.flags.0 & LLKHF_EXTENDED != 0 {
+fn key_name(key: &RecordedKey) -> String {
+    let mut lparam = ((key.scan_code & 0xFF) as i32) << 16;
+    if key.extended {
         lparam |= 1 << 24;
     }
     let mut buffer = [0u16; 64];
@@ -1096,90 +1785,375 @@ fn key_name(key: &KBDLLHOOKSTRUCT) -> String {
     if length > 0 {
         String::from_utf16_lossy(&buffer[..length as usize])
     } else {
-        format!("key {:#04x}", key.vkCode)
+        format!("key {:#04x}", key.vk)
     }
 }
 
-/// Opens the overlay for `mode`. Runs on the low-level keyboard hook thread,
-/// so it must stay fast: it only enumerates windows and reuses cached icons,
-/// then hands the expensive icon/display-name work to a worker thread.
-/// Returns whether the overlay opened, so the caller knows if the hotkey was
-/// consumed.
-fn open_switcher(runtime: &HookRuntime, mode: &str, reverse: bool) -> bool {
-    let mut watch = timing::Stopwatch::start("open");
-    let active = unsafe { GetForegroundWindow() };
-    if active.0.is_null() {
-        return false;
+/// Starts the controller thread. Commands posted before it runs wait in the
+/// channel. Must be called before the hook is installed.
+fn start_controller() {
+    let (sender, receiver) = mpsc::channel();
+    let _ = CONTROLLER.set(ControllerHandle {
+        sender: Mutex::new(sender),
+        thread_id: AtomicU32::new(0),
+    });
+    let spawned = thread::Builder::new()
+        .name("switcher-controller".into())
+        .spawn(move || run_controller(receiver));
+    if let Err(error) = spawned {
+        let message = format!("Window Switcher could not start its switcher thread.\n\n{error}");
+        log::error!("{message}");
+        show_error_message(&message);
+        std::process::exit(1);
     }
-    let targets = match mode {
-        MODE_WINDOW => windows_for_current_app(active),
-        MODE_APP => application_targets(active),
-        _ => Vec::new(),
+}
+
+fn run_controller(receiver: mpsc::Receiver<Command>) {
+    let Some(runtime) = RUNTIME.get() else {
+        log::error!("the switcher controller started without a runtime");
+        return;
     };
-    timing::mark(&mut watch, "enumerated");
-    // The window switcher also opens for a single window, so the hotkey always
-    // gives visible feedback; releasing Alt just re-activates that window. The
-    // app switcher still needs two apps, otherwise Win+Tab falls through to
-    // Task View. With no window at all (desktop, taskbar) both pass through.
-    let min_targets = if mode == MODE_WINDOW { 1 } else { 2 };
-    if targets.len() < min_targets {
-        log::debug!("nothing to switch to for mode {mode}");
-        return false;
+    let Some(handle) = CONTROLLER.get() else { return };
+    unsafe {
+        // Window identity (AppUserModelID) and shell names use COM. This
+        // thread pumps messages, as a single-threaded apartment should.
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        // Create the message queue before publishing the thread id, so no
+        // wake-up message can be lost; then drain what was already queued.
+        let mut message = MSG::default();
+        let _ = PeekMessageW(&mut message, None, WM_APP, WM_APP, PM_NOREMOVE);
+        handle
+            .thread_id
+            .store(GetCurrentThreadId(), Ordering::SeqCst);
+    }
+    let mut controller = Controller {
+        runtime,
+        receiver,
+        pending: VecDeque::new(),
+        watchdog_timer: 0,
+        watchdog_misses: 0,
+        app_hint_timer: unsafe { SetTimer(None, 0, APP_HINT_INTERVAL_MS, None) },
+        app_keys: HashMap::new(),
+    };
+    controller.refresh_app_hint();
+    controller.drain();
+    let mut message = MSG::default();
+    unsafe {
+        while GetMessageW(&mut message, None, 0, 0).as_bool() {
+            if message.hwnd.0.is_null() {
+                if message.message == WM_CONTROLLER_WAKE {
+                    controller.drain();
+                    continue;
+                }
+                if message.message == WM_TIMER {
+                    controller.on_timer(message.wParam.0);
+                    continue;
+                }
+            }
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+}
+
+/// Owns the switcher session: everything the hook asks for happens here, one
+/// command at a time, in the order the keys were pressed.
+struct Controller {
+    runtime: &'static HookRuntime,
+    receiver: mpsc::Receiver<Command>,
+    /// Commands taken from the channel but not handled yet, so an opening can
+    /// see that its release is already queued.
+    pending: VecDeque<Command>,
+    watchdog_timer: usize,
+    watchdog_misses: u8,
+    app_hint_timer: usize,
+    /// HWND -> (process id, app key), so recounting apps only queries new
+    /// windows.
+    app_keys: HashMap<isize, (u32, String)>,
+}
+
+impl Controller {
+    fn receive(&mut self) {
+        while let Ok(command) = self.receiver.try_recv() {
+            self.pending.push_back(command);
+        }
     }
 
-    // Bump first so any icon worker from a previous overlay drops its work.
-    let generation = SWITCHER_GENERATION
-        .fetch_add(1, Ordering::SeqCst)
-        .wrapping_add(1);
-    let card_style = current_card_style();
-    let items = targets
-        .iter()
-        .map(|target| target_to_item_cached(target, card_style))
-        .collect::<Vec<_>>();
-    let selected = if reverse {
-        targets.len() - 1
-    } else {
-        1 % targets.len()
-    };
-    let hint = shortcut_for(mode).hint();
-    let needs_work = needs_item_work(&targets);
-    timing::mark(&mut watch, "items");
-    if let Some(watch) = &watch {
-        timing::opened(generation, watch.start_instant());
+    fn drain(&mut self) {
+        self.receive();
+        while let Some(command) = self.pending.pop_front() {
+            // A panic in one command must not take the switcher down with it.
+            let handled =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.handle(command)));
+            if handled.is_err() {
+                log::error!("the switcher controller panicked while handling a command");
+            }
+            self.receive();
+        }
     }
 
-    match runtime.state.lock() {
-        Ok(mut state) => {
+    fn handle(&mut self, command: Command) {
+        match command {
+            Command::Open {
+                mode,
+                reverse,
+                generation,
+                vk,
+                scan_code,
+                at,
+            } => self.open(mode, reverse, generation, (vk, scan_code), at),
+            Command::Advance {
+                generation,
+                reverse,
+                at,
+            } => {
+                let mut watch = timing::Stopwatch::start_at("advance", at);
+                timing::mark(&mut watch, "dequeued");
+                advance_switcher(self.runtime, generation, reverse, &mut watch);
+                timing::finish(watch, "");
+            }
+            Command::Commit { generation, at } => {
+                self.stop_watchdog();
+                commit_switcher(self.runtime, generation, at);
+                log_hook_timing();
+                self.refresh_app_hint();
+            }
+            Command::Cancel { generation, reason } => {
+                self.stop_watchdog();
+                if cancel_generation(self.runtime, generation) {
+                    log::info!("switcher closed: {reason}");
+                }
+                log_hook_timing();
+            }
+            Command::RecordKey(key) => emit_recorded_hotkey(self.runtime, &key),
+            Command::Reshow => emit_and_show(self.runtime, &mut None),
+        }
+    }
+
+    /// Whether a later command already closes or replaces opening
+    /// `generation` (`(closes, commits)`).
+    fn queued_close(&self, generation: u64) -> (bool, bool) {
+        let mut closes = false;
+        let mut commits = false;
+        for command in &self.pending {
+            match command {
+                Command::Commit { generation: g, .. } if *g == generation => {
+                    closes = true;
+                    commits = true;
+                }
+                Command::Cancel { generation: g, .. } if *g == generation => closes = true,
+                Command::Open { generation: g, .. } if *g != generation => closes = true,
+                _ => {}
+            }
+        }
+        (closes, commits)
+    }
+
+    fn open(
+        &mut self,
+        mode: SwitchMode,
+        reverse: bool,
+        generation: u64,
+        key: (u32, u32),
+        at: Instant,
+    ) {
+        let mut watch = timing::Stopwatch::start_at("open", at);
+        timing::mark(&mut watch, "dequeued");
+        self.receive();
+        let (closed, committed) = self.queued_close(generation);
+        if closed && !committed {
+            // Escape or another opening is already queued: nothing to show.
+            return;
+        }
+        let origin = switch_origin();
+        let targets = match (mode, origin) {
+            (SwitchMode::Window, Some((active, _))) => windows_for_current_app(active),
+            (SwitchMode::App, Some((active, _))) => application_targets(active),
+            (_, None) => Vec::new(),
+        };
+        timing::mark(&mut watch, "enumerated");
+        let from_own_window = origin.is_some_and(|(_, own)| own);
+        if mode == SwitchMode::App {
+            APP_TARGETS_HINT.store(targets.len(), Ordering::SeqCst);
+        }
+        let min_targets = if mode == SwitchMode::Window || from_own_window {
+            1
+        } else {
+            2
+        };
+        if targets.len() < min_targets {
+            log::debug!("nothing to switch to for mode {}", mode.as_str());
+            // The hook swallowed the shortcut on a stale guess; hand it to
+            // Windows after all (also after a quick tap whose release is
+            // queued), unless Escape or another opening already ended it.
+            if close_hook_session(generation) || committed {
+                replay_shortcut(shortcut_for(mode.as_str()).modifier, key.0, key.1);
+            }
+            return;
+        }
+
+        let worker_targets = (!committed && needs_item_work(&targets)).then(|| targets.clone());
+        let needs_work = worker_targets.is_some();
+        let card_style = current_card_style();
+        let items = targets
+            .iter()
+            .map(|target| target_to_item_cached(target, card_style))
+            .collect::<Vec<_>>();
+        let selected = if reverse {
+            targets.len() - 1
+        } else if from_own_window {
+            0
+        } else {
+            1 % targets.len()
+        };
+        let hint = shortcut_for(mode.as_str()).hint();
+        timing::mark(&mut watch, "items");
+        if let Some(watch) = &watch {
+            timing::opened(generation, watch.start_instant());
+        }
+        let count = targets.len();
+        let icons_cached = if watch.is_some() {
+            targets
+                .iter()
+                .filter(|target| cache_lookup(icon_cache(), &target_key(target)).is_some())
+                .count()
+        } else {
+            0
+        };
+        if let Ok(mut state) = self.runtime.state.lock() {
             state.active = Some(ActiveSwitcher {
-                mode: mode.to_string(),
+                mode: mode.as_str().to_string(),
                 hint,
                 generation,
                 card_style,
                 layout: current_layout(),
-                targets: targets.clone(),
+                targets,
                 items,
                 selected,
             });
+        } else {
+            return;
         }
-        Err(_) => return false,
+        if committed {
+            // A quick tap: the release is already queued, so skip drawing an
+            // overlay that would be hidden again right away.
+            timing::finish(watch, &format!("#{generation} quick tap, not shown"));
+            return;
+        }
+        emit_and_show(self.runtime, &mut watch);
+        timing::finish(
+            watch,
+            &format!(
+                "#{generation} mode={} cards={count} icons_cached={icons_cached} worker={needs_work}",
+                mode.as_str()
+            ),
+        );
+        if let Some(targets) = worker_targets {
+            spawn_item_worker(self.runtime, generation, targets);
+        }
+        self.start_watchdog();
     }
 
-    emit_and_show(runtime, &mut watch);
-    if watch.is_some() {
-        let detail = format!(
-            "#{generation} mode={mode} cards={} icons_cached={} worker={needs_work}",
-            targets.len(),
-            targets
-                .iter()
-                .filter(|target| cache_lookup(icon_cache(), &target_key(target)).is_some())
-                .count(),
+    /// Starts the watchdog that closes the overlay if its modifier is
+    /// released without the hook seeing it (no key event follows a release
+    /// lost to the secure desktop). The timer runs on this thread's loop.
+    fn start_watchdog(&mut self) {
+        self.watchdog_misses = 0;
+        if self.watchdog_timer == 0 {
+            self.watchdog_timer = unsafe { SetTimer(None, 0, WATCHDOG_INTERVAL_MS, None) };
+        }
+    }
+
+    fn stop_watchdog(&mut self) {
+        if self.watchdog_timer != 0 {
+            unsafe {
+                let _ = KillTimer(None, self.watchdog_timer);
+            }
+            self.watchdog_timer = 0;
+        }
+    }
+
+    fn on_timer(&mut self, id: usize) {
+        if id == self.app_hint_timer {
+            self.refresh_app_hint();
+        } else if id == self.watchdog_timer {
+            self.check_watchdog();
+        }
+    }
+
+    /// Requires two misses in a row so a single odd read never closes it.
+    fn check_watchdog(&mut self) {
+        let Some((generation, mode)) = active_switcher(self.runtime) else {
+            self.stop_watchdog();
+            return;
+        };
+        if shortcut_for(&mode)
+            .modifier
+            .is_down(alt_key_down(), win_key_down())
+        {
+            self.watchdog_misses = 0;
+            return;
+        }
+        self.watchdog_misses += 1;
+        // Only close a session the hook still has open; otherwise its own
+        // commit or cancel is already queued.
+        if self.watchdog_misses >= 2 && close_hook_session(generation) {
+            log::warn!("switcher modifier was released unseen; closing the overlay");
+            self.stop_watchdog();
+            cancel_generation(self.runtime, generation);
+        }
+    }
+
+    /// Recounts the apps Win+Tab would show, for the hook's swallow decision.
+    /// Only windows not seen before are queried for their process and app id.
+    fn refresh_app_hint(&mut self) {
+        if HOOK_SESSION.load(Ordering::SeqCst) != 0 {
+            return;
+        }
+        let mut seen = HashSet::new();
+        let mut apps = HashSet::new();
+        for hwnd in switchable_windows() {
+            let raw = hwnd.0 as isize;
+            let mut pid = 0;
+            unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+            let cached = self
+                .app_keys
+                .get(&raw)
+                .filter(|(cached_pid, _)| *cached_pid == pid)
+                .map(|(_, key)| key.clone());
+            let key = match cached {
+                Some(key) => Some(key),
+                None => process_path_for_window(hwnd).map(|path| {
+                    let key = window_key(hwnd, &path);
+                    self.app_keys.insert(raw, (pid, key.clone()));
+                    key
+                }),
+            };
+            if let Some(key) = key {
+                seen.insert(raw);
+                apps.insert(key);
+            }
+        }
+        self.app_keys.retain(|hwnd, _| seen.contains(hwnd));
+        APP_TARGETS_HINT.store(apps.len(), Ordering::SeqCst);
+    }
+}
+
+/// Logs how long the hook procedure took since the last switch.
+fn log_hook_timing() {
+    if !timing::enabled() {
+        return;
+    }
+    let calls = HOOK_CALLS.swap(0, Ordering::Relaxed);
+    let total = HOOK_TOTAL_NS.swap(0, Ordering::Relaxed);
+    let max = HOOK_MAX_NS.swap(0, Ordering::Relaxed);
+    if calls > 0 {
+        log::info!(
+            "[timing] hook: {calls} events, avg {:.1} us, max {:.1} us",
+            total as f64 / calls as f64 / 1000.0,
+            max as f64 / 1000.0
         );
-        timing::finish(watch, &detail);
     }
-    if needs_work {
-        spawn_item_worker(runtime, generation, targets);
-    }
-    true
 }
 
 fn shortcut_for(mode: &str) -> Shortcut {
@@ -1190,20 +2164,26 @@ fn shortcut_for(mode: &str) -> Shortcut {
     }
 }
 
-fn advance_switcher(runtime: &HookRuntime, reverse: bool) {
-    let mut watch = timing::Stopwatch::start("advance");
+fn advance_switcher(
+    runtime: &HookRuntime,
+    generation: u64,
+    reverse: bool,
+    watch: &mut Option<timing::Stopwatch>,
+) {
     if let Ok(mut state) = runtime.state.lock() {
-        if let Some(active) = &mut state.active {
-            if reverse {
-                active.selected =
-                    (active.selected + active.targets.len() - 1) % active.targets.len();
-            } else {
-                active.selected = (active.selected + 1) % active.targets.len();
+        match &mut state.active {
+            Some(active) if active.generation == generation && !active.targets.is_empty() => {
+                let count = active.targets.len();
+                active.selected = if reverse {
+                    (active.selected + count - 1) % count
+                } else {
+                    (active.selected + 1) % count
+                };
             }
+            _ => return,
         }
     }
-    emit_selection(runtime, &mut watch);
-    timing::finish(watch, "");
+    emit_selection(runtime, watch);
 }
 
 #[derive(Clone, Serialize)]
@@ -1229,12 +2209,28 @@ fn emit_selection(runtime: &HookRuntime, watch: &mut Option<timing::Stopwatch>) 
     timing::mark(watch, "emitted");
 }
 
-fn cancel_switcher(runtime: &HookRuntime) -> bool {
+/// Held while the switcher state is checked and the overlays are shown or
+/// hidden as a result, so a show from another thread can never land after
+/// the controller closed the switcher and hid them.
+static OVERLAY_VISIBILITY: Mutex<()> = Mutex::new(());
+
+fn lock_overlay_visibility() -> MutexGuard<'static, ()> {
+    lock_unpoisoned(&OVERLAY_VISIBILITY)
+}
+
+/// Closes the overlay only if it is still showing `generation`.
+fn cancel_generation(runtime: &HookRuntime, generation: u64) -> bool {
+    let _visibility = lock_overlay_visibility();
     let was_active = runtime
         .state
         .lock()
         .ok()
-        .map(|mut state| state.active.take().is_some())
+        .map(|mut state| {
+            state
+                .active
+                .take_if(|active| active.generation == generation)
+                .is_some()
+        })
         .unwrap_or(false);
     if was_active {
         let mut watch = timing::Stopwatch::start("cancel");
@@ -1245,15 +2241,22 @@ fn cancel_switcher(runtime: &HookRuntime) -> bool {
     was_active
 }
 
-fn commit_switcher(runtime: &HookRuntime) {
-    let mut watch = timing::Stopwatch::start("release");
-    let selection = runtime.state.lock().ok().and_then(|mut state| {
-        state
-            .active
-            .take()
-            .map(|active| (active.targets, active.selected))
-    });
-    hide_overlay(&runtime.app);
+fn commit_switcher(runtime: &HookRuntime, generation: u64, at: Instant) {
+    let mut watch = timing::Stopwatch::start_at("release", at);
+    timing::mark(&mut watch, "dequeued");
+    let selection = {
+        let _visibility = lock_overlay_visibility();
+        let selection = runtime.state.lock().ok().and_then(|mut state| {
+            state
+                .active
+                .take_if(|active| active.generation == generation)
+                .map(|active| (active.targets, active.selected))
+        });
+        if selection.is_some() {
+            hide_overlay(&runtime.app);
+        }
+        selection
+    };
     timing::mark(&mut watch, "hidden");
 
     let Some((targets, selected)) = selection else {
@@ -1278,6 +2281,8 @@ fn commit_switcher(runtime: &HookRuntime) {
     log::warn!("unable to activate any window for the current selection");
 }
 
+/// Brings `hwnd` to the front from a background thread. Never sleeps or
+/// waits on the target: a hung app cannot stall the controller.
 fn activate_window(hwnd: HWND) -> bool {
     unsafe {
         if !IsWindow(hwnd).as_bool() {
@@ -1285,34 +2290,42 @@ fn activate_window(hwnd: HWND) -> bool {
             return false;
         }
         if IsIconic(hwnd).as_bool() {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
+            // Asynchronous: `ShowWindow` on another process's window waits
+            // for that process to handle the restore.
+            let _ = ShowWindowAsync(hwnd, SW_RESTORE);
         }
-        // The overlay never takes focus, so Windows' foreground lock rejects
-        // SetForegroundWindow from this background thread. Sharing input state
-        // with the current foreground thread lifts that restriction. Retry
-        // once: the first call can lose a race with the shell.
-        for attempt in 0..2 {
-            let foreground = GetForegroundWindow();
-            let foreground_thread = GetWindowThreadProcessId(foreground, None);
-            let current_thread = GetCurrentThreadId();
-            let attached = foreground_thread != 0
-                && foreground_thread != current_thread
-                && AttachThreadInput(current_thread, foreground_thread, BOOL(1)).as_bool();
-            let _ = BringWindowToTop(hwnd);
-            let raised = SetForegroundWindow(hwnd).as_bool();
-            if attached {
-                let _ = AttachThreadInput(current_thread, foreground_thread, BOOL(0));
-            }
-            if raised {
-                return true;
-            }
-            if attempt == 0 {
-                thread::sleep(Duration::from_millis(10));
-            }
+        if set_foreground(hwnd) {
+            return true;
+        }
+        // The shell can win a race for the foreground right after a key
+        // release. Input we inject counts as user activity for the
+        // foreground lock, so send the harmless mask key and try once more.
+        send_mask_key();
+        if set_foreground(hwnd) {
+            log::info!("activated the window on the second attempt");
+            return true;
         }
         log::warn!("SetForegroundWindow failed for the selected window");
         false
     }
+}
+
+/// The overlay never takes focus, so Windows' foreground lock rejects
+/// `SetForegroundWindow` from this background thread. Sharing input state
+/// with the current foreground thread lifts that restriction.
+unsafe fn set_foreground(hwnd: HWND) -> bool {
+    let foreground = GetForegroundWindow();
+    let foreground_thread = GetWindowThreadProcessId(foreground, None);
+    let current_thread = GetCurrentThreadId();
+    let attached = foreground_thread != 0
+        && foreground_thread != current_thread
+        && AttachThreadInput(current_thread, foreground_thread, BOOL(1)).as_bool();
+    let _ = BringWindowToTop(hwnd);
+    let raised = SetForegroundWindow(hwnd).as_bool();
+    if attached {
+        let _ = AttachThreadInput(current_thread, foreground_thread, BOOL(0));
+    }
+    raised
 }
 
 fn payload_snapshot(state: &SwitcherState) -> Option<SwitcherPayload> {
@@ -1332,6 +2345,10 @@ fn payload_snapshot(state: &SwitcherState) -> Option<SwitcherPayload> {
 /// Emits the current payload and sizes/shows the overlay. Never holds the
 /// state lock while talking to the windowing system.
 fn emit_and_show(runtime: &HookRuntime, watch: &mut Option<timing::Stopwatch>) {
+    // The visibility lock (not the state lock) spans the check and the show:
+    // closing takes it before taking the state and hiding, so a show from the
+    // overlay-creation thread can never land after the overlays were hidden.
+    let _visibility = lock_overlay_visibility();
     let payload = runtime
         .state
         .lock()
@@ -1569,7 +2586,8 @@ fn overlay_size(
     // row as the monitor allows so no card is ever clipped. If the rows are
     // taller than the monitor, the height is capped: icon cards scroll, and
     // preview cards shrink in the frontend until they fit.
-    let max_width = (work_width - 40.0).max(460.0);
+    // Never wider than the monitor, even on one narrower than 460 px.
+    let max_width = (work_width - 40.0).max(460.0).min(work_width);
     let columns = (((max_width - OVERLAY_CHROME) / pitch).floor() as usize).max(1);
     let rows = count.div_ceil(columns);
     let height = (OVERLAY_HEADER + rows as f64 * row_height)
@@ -1606,7 +2624,7 @@ fn vertical_overlay_size(
     };
     let count = count.max(1);
     let max_height = (work_height - VERTICAL_MARGIN).max(VERTICAL_HEADER + row);
-    let max_width = (work_width - 40.0).max(MIN_OVERLAY_WIDTH);
+    let max_width = (work_width - 40.0).max(MIN_OVERLAY_WIDTH).min(work_width);
     let rows_fit = (((max_height - VERTICAL_HEADER + gap) / (row + gap)).floor() as usize).max(1);
     let columns = count.div_ceil(rows_fit);
     let rows = count.div_ceil(columns);
@@ -1701,9 +2719,7 @@ fn spawn_overlay_windows(app: AppHandle, count: usize) {
             CREATING_OVERLAYS.store(false, Ordering::SeqCst);
             // If the switcher is open right now, put the new overlays on screen.
             if created && current_monitor_mode() == MonitorMode::Every {
-                if let Some(runtime) = RUNTIME.get() {
-                    emit_and_show(runtime, &mut None);
-                }
+                post_command(Command::Reshow);
             }
         });
     if let Err(error) = spawned {
@@ -1724,6 +2740,14 @@ fn prepare_overlay_window(window: &WebviewWindow) {
     {
         hwnds.insert(window.label().to_string(), hwnd.0 as isize);
     }
+    let label = window.label().to_string();
+    window.on_window_event(move |event| {
+        if let WindowEvent::Destroyed = event {
+            if let Some(Ok(mut hwnds)) = OVERLAY_HWNDS.get().map(Mutex::lock) {
+                hwnds.remove(&label);
+            }
+        }
+    });
     let disabled = BOOL::from(true);
     let result = unsafe {
         DwmSetWindowAttribute(
@@ -1979,6 +3003,23 @@ fn window_icon(hwnd: HWND) -> Option<String> {
         }
         icon_to_data_uri(HICON(icon))
     }
+}
+
+/// Top-level windows the switcher could offer, in z-order, without the
+/// per-window process and COM lookups of `eligible_windows`.
+fn switchable_windows() -> Vec<HWND> {
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let windows = &mut *(lparam.0 as *mut Vec<HWND>);
+        if is_switchable(hwnd) {
+            windows.push(hwnd);
+        }
+        BOOL(1)
+    }
+    let mut windows = Vec::<HWND>::new();
+    unsafe {
+        let _ = EnumWindows(Some(visit), LPARAM(&mut windows as *mut Vec<HWND> as isize));
+    }
+    windows
 }
 
 fn eligible_windows() -> Vec<Target> {
@@ -2328,6 +3369,10 @@ fn get_settings() -> SettingsPayload {
 /// returns every setting. Each key validates its own value; a new setting is
 /// one more match arm. Async so it runs off the main thread: it may create or
 /// destroy webviews.
+///
+/// Every setting is saved first and only then made live, both under the
+/// config lock: a failed save changes nothing, and two quick changes can
+/// never leave memory and the file holding different values.
 #[tauri::command]
 async fn set_setting(
     app: AppHandle,
@@ -2347,7 +3392,9 @@ async fn set_setting(
 fn apply_monitor_mode(app: &AppHandle, value: &str) -> Result<(), String> {
     let mode =
         MonitorMode::parse(value).ok_or_else(|| format!("unknown monitor mode {value:?}"))?;
-    MONITOR_MODE.store(mode.to_u8(), Ordering::SeqCst);
+    persist(&[("show_switcher_on", mode.as_str().to_string())], || {
+        MONITOR_MODE.store(mode.to_u8(), Ordering::SeqCst)
+    })?;
     log::info!("switcher shows on: {}", mode.as_str());
 
     if mode == MonitorMode::Every {
@@ -2360,28 +3407,38 @@ fn apply_monitor_mode(app: &AppHandle, value: &str) -> Result<(), String> {
             }
         }
     }
-    save_config_value("show_switcher_on", mode.as_str())
+    Ok(())
 }
 
 /// Swaps one hotkey live: the keyboard hook reads it on the next key press,
 /// and the overlay hint follows because it is derived when the overlay opens.
+/// Choosing the other switcher's shortcut swaps the two, saved in one write.
 fn apply_hotkey(app: &AppHandle, key: &str, value: &str) -> Result<(), String> {
     let shortcut = Shortcut::parse(value).ok_or_else(|| {
         format!("unsupported shortcut {value:?}: use Alt or Win with Tab or Backtick")
     })?;
-    let (window, apps) = if key == "window_hotkey" {
-        (shortcut, app_shortcut())
-    } else {
-        (window_shortcut(), shortcut)
+    let (window, apps) = {
+        let lock = lock_config();
+        let (mut window, mut apps) = (window_shortcut(), app_shortcut());
+        let (changed, other) = if key == "window_hotkey" {
+            (&mut window, &mut apps)
+        } else {
+            (&mut apps, &mut window)
+        };
+        if *other == shortcut {
+            *other = *changed;
+        }
+        *changed = shortcut;
+        save_config_values(
+            &lock,
+            &[
+                ("window_hotkey", window.config_value()),
+                ("app_hotkey", apps.config_value()),
+            ],
+        )?;
+        store_shortcuts(window, apps);
+        (window, apps)
     };
-    if window == apps {
-        return Err(format!(
-            "{} is already used by the other switcher",
-            shortcut.hint()
-        ));
-    }
-    save_config_value(key, &shortcut.config_value())?;
-    store_shortcuts(window, apps);
     log::info!(
         "window shortcut: {} | app shortcut: {}",
         window.hint(),
@@ -2391,13 +3448,16 @@ fn apply_hotkey(app: &AppHandle, key: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Restores both hotkeys to their defaults in one step, so swapped hotkeys
-/// never trip the "already used" check halfway through.
+/// Restores both hotkeys to their defaults in one write.
 #[tauri::command]
 fn reset_hotkeys(app: AppHandle) -> Result<SettingsPayload, String> {
-    save_config_value("window_hotkey", &DEFAULT_WINDOW_SHORTCUT.config_value())?;
-    save_config_value("app_hotkey", &DEFAULT_APP_SHORTCUT.config_value())?;
-    store_shortcuts(DEFAULT_WINDOW_SHORTCUT, DEFAULT_APP_SHORTCUT);
+    persist(
+        &[
+            ("window_hotkey", DEFAULT_WINDOW_SHORTCUT.config_value()),
+            ("app_hotkey", DEFAULT_APP_SHORTCUT.config_value()),
+        ],
+        || store_shortcuts(DEFAULT_WINDOW_SHORTCUT, DEFAULT_APP_SHORTCUT),
+    )?;
     log::info!("hotkeys reset to defaults");
     refresh_tray_tooltip(&app);
     Ok(get_settings())
@@ -2409,23 +3469,31 @@ fn reset_hotkeys(app: AppHandle) -> Result<SettingsPayload, String> {
 /// `settings:hotkey-recorded` event; the hotkeys themselves do not fire.
 #[tauri::command]
 fn set_hotkey_recording(active: bool) {
+    log::debug!(
+        "set_hotkey_recording({active}); settings foreground: {}",
+        settings_is_foreground()
+    );
     RECORDING_HOTKEY.store(active, Ordering::SeqCst);
 }
 
 /// Takes effect the next time the switcher opens.
 fn apply_card_style(value: &str) -> Result<(), String> {
     let style = CardStyle::parse(value).ok_or_else(|| format!("unknown card style {value:?}"))?;
-    PREVIEW_CARDS.store(style == CardStyle::Preview, Ordering::SeqCst);
+    persist(&[("card_style", style.as_str().to_string())], || {
+        PREVIEW_CARDS.store(style == CardStyle::Preview, Ordering::SeqCst)
+    })?;
     log::info!("card style: {}", style.as_str());
-    save_config_value("card_style", style.as_str())
+    Ok(())
 }
 
 /// Takes effect the next time the switcher opens.
 fn apply_layout(value: &str) -> Result<(), String> {
     let layout = Layout::parse(value).ok_or_else(|| format!("unknown layout {value:?}"))?;
-    VERTICAL_LAYOUT.store(layout == Layout::Vertical, Ordering::SeqCst);
+    persist(&[("layout", layout.as_str().to_string())], || {
+        VERTICAL_LAYOUT.store(layout == Layout::Vertical, Ordering::SeqCst)
+    })?;
     log::info!("layout: {}", layout.as_str());
-    save_config_value("layout", layout.as_str())
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2610,5 +3678,280 @@ fn fit_thumbnail(thumbnail: isize, slot: &ThumbnailSlot, scale: f64) -> RECT {
         top: y.round() as i32,
         right: (x + fit_width).round() as i32,
         bottom: (y + fit_height).round() as i32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TAB: u32 = VK_TAB.0 as u32;
+    const BACKTICK: u32 = VK_OEM_3.0 as u32;
+    const ESC: u32 = VK_ESCAPE.0 as u32;
+    const LWIN: u32 = VK_LWIN.0 as u32;
+    const LALT: u32 = VK_LMENU.0 as u32;
+
+    /// Win held, Tab pressed, no session, an ordinary app in front.
+    fn base() -> KeyInput {
+        KeyInput {
+            vk: TAB,
+            scan_code: 0x0F,
+            down: true,
+            alt: false,
+            win: true,
+            shift: false,
+            session: None,
+            recording: false,
+            foreground: Foreground::Other,
+            app_targets: 3,
+            window_shortcut: DEFAULT_WINDOW_SHORTCUT,
+            app_shortcut: DEFAULT_APP_SHORTCUT,
+        }
+    }
+
+    fn open(mode: SwitchMode, reverse: bool) -> Decision {
+        Decision {
+            close_stale: false,
+            action: Action::Open { mode, reverse },
+            swallow: true,
+            mask: true,
+        }
+    }
+
+    #[test]
+    fn win_tab_opens_the_app_switcher() {
+        assert_eq!(decide_key(&base()), open(SwitchMode::App, false));
+    }
+
+    #[test]
+    fn shift_opens_reversed() {
+        let input = KeyInput {
+            shift: true,
+            ..base()
+        };
+        assert_eq!(decide_key(&input), open(SwitchMode::App, true));
+    }
+
+    #[test]
+    fn alt_backtick_opens_the_window_switcher_even_for_one_window() {
+        let input = KeyInput {
+            vk: BACKTICK,
+            scan_code: 0x29,
+            alt: true,
+            win: false,
+            app_targets: 0,
+            ..base()
+        };
+        assert_eq!(decide_key(&input), open(SwitchMode::Window, false));
+        // The French "²" key: another virtual key, the same scan code.
+        let french = KeyInput { vk: 0xDE, ..input };
+        assert_eq!(decide_key(&french), open(SwitchMode::Window, false));
+    }
+
+    #[test]
+    fn win_tab_with_one_app_falls_through_to_task_view() {
+        let input = KeyInput {
+            app_targets: 1,
+            ..base()
+        };
+        assert_eq!(decide_key(&input), Decision::PASS);
+    }
+
+    #[test]
+    fn from_settings_one_other_app_is_enough() {
+        let input = KeyInput {
+            app_targets: 1,
+            foreground: Foreground::Own,
+            ..base()
+        };
+        assert_eq!(decide_key(&input), open(SwitchMode::App, false));
+    }
+
+    #[test]
+    fn nothing_opens_without_a_foreground_window() {
+        let input = KeyInput {
+            foreground: Foreground::None,
+            ..base()
+        };
+        assert_eq!(decide_key(&input), Decision::PASS);
+    }
+
+    #[test]
+    fn tab_and_shift_tab_advance_an_open_session() {
+        let open = KeyInput {
+            session: Some(SwitchMode::App),
+            ..base()
+        };
+        let forward = decide_key(&open);
+        assert_eq!(forward.action, Action::Advance { reverse: false });
+        assert!(forward.swallow && forward.mask && !forward.close_stale);
+        let back = decide_key(&KeyInput {
+            shift: true,
+            ..open
+        });
+        assert_eq!(back.action, Action::Advance { reverse: true });
+    }
+
+    #[test]
+    fn releasing_the_modifier_commits_without_swallowing() {
+        let release = KeyInput {
+            vk: LWIN,
+            scan_code: 0x5B,
+            down: false,
+            session: Some(SwitchMode::App),
+            ..base()
+        };
+        let decision = decide_key(&release);
+        assert_eq!(decision.action, Action::Commit);
+        assert!(!decision.swallow && !decision.mask);
+        // Releasing Tab (or another key) keeps the session open.
+        let tab_up = KeyInput { vk: TAB, ..release };
+        assert_eq!(decide_key(&tab_up), Decision::PASS);
+    }
+
+    #[test]
+    fn the_commit_key_follows_the_configured_modifier() {
+        // Shortcuts swapped in Settings: windows on Win+Tab, apps on Alt+`.
+        let swapped = KeyInput {
+            window_shortcut: DEFAULT_APP_SHORTCUT,
+            app_shortcut: DEFAULT_WINDOW_SHORTCUT,
+            session: Some(SwitchMode::Window),
+            down: false,
+            ..base()
+        };
+        let win_up = KeyInput {
+            vk: LWIN,
+            ..swapped
+        };
+        assert_eq!(decide_key(&win_up).action, Action::Commit);
+        let alt_up = KeyInput {
+            vk: LALT,
+            alt: true,
+            ..swapped
+        };
+        assert_eq!(decide_key(&alt_up).action, Action::PassThrough);
+    }
+
+    #[test]
+    fn escape_cancels_and_is_swallowed() {
+        let input = KeyInput {
+            vk: ESC,
+            scan_code: 0x01,
+            session: Some(SwitchMode::App),
+            ..base()
+        };
+        let decision = decide_key(&input);
+        assert_eq!(decision.action, Action::Cancel);
+        assert!(decision.swallow && decision.mask);
+        // Without a session, Escape is an ordinary key.
+        let closed = KeyInput {
+            session: None,
+            ..input
+        };
+        assert_eq!(decide_key(&closed), Decision::PASS);
+    }
+
+    #[test]
+    fn a_missed_modifier_release_closes_the_session() {
+        // The session is open but Win is no longer held: the next key closes
+        // it and is then handled as if nothing was open.
+        let input = KeyInput {
+            vk: 0x41, // A
+            scan_code: 0x1E,
+            win: false,
+            session: Some(SwitchMode::App),
+            ..base()
+        };
+        let decision = decide_key(&input);
+        assert!(decision.close_stale);
+        assert_eq!(decision.action, Action::PassThrough);
+        assert!(!decision.swallow);
+        // ...even when that key is Escape, which then passes through.
+        let escape = decide_key(&KeyInput { vk: ESC, ..input });
+        assert!(escape.close_stale && !escape.swallow);
+        // A new shortcut after the missed release opens a fresh session.
+        let reopen = decide_key(&KeyInput {
+            vk: BACKTICK,
+            scan_code: 0x29,
+            alt: true,
+            ..input
+        });
+        assert!(reopen.close_stale);
+        assert_eq!(
+            reopen.action,
+            Action::Open {
+                mode: SwitchMode::Window,
+                reverse: false
+            }
+        );
+    }
+
+    #[test]
+    fn the_other_shortcut_switches_modes_while_open() {
+        let input = KeyInput {
+            vk: BACKTICK,
+            scan_code: 0x29,
+            alt: true,
+            session: Some(SwitchMode::App),
+            ..base()
+        };
+        assert_eq!(decide_key(&input), open(SwitchMode::Window, false));
+    }
+
+    #[test]
+    fn recording_swallows_combinations_and_passes_modifiers() {
+        let recording = KeyInput {
+            recording: true,
+            ..base()
+        };
+        let decision = decide_key(&recording);
+        assert_eq!(decision.action, Action::RecordKey);
+        assert!(decision.swallow && decision.mask);
+        // A plain key needs no mask key.
+        let plain = decide_key(&KeyInput {
+            vk: 0x51, // Q
+            win: false,
+            ..recording
+        });
+        assert_eq!(plain.action, Action::RecordKey);
+        assert!(plain.swallow && !plain.mask);
+        // Modifiers and key releases pass through.
+        let modifier = KeyInput {
+            vk: LWIN,
+            ..recording
+        };
+        assert_eq!(decide_key(&modifier), Decision::PASS);
+        let release = KeyInput {
+            down: false,
+            ..recording
+        };
+        assert_eq!(decide_key(&release), Decision::PASS);
+    }
+
+    #[test]
+    fn unrelated_keys_pass_through() {
+        let input = KeyInput {
+            vk: 0x41,
+            scan_code: 0x1E,
+            ..base()
+        };
+        assert_eq!(decide_key(&input), Decision::PASS);
+        let alt_tab = KeyInput {
+            alt: true,
+            win: false,
+            ..base()
+        };
+        assert_eq!(decide_key(&alt_tab), Decision::PASS);
+    }
+
+    #[test]
+    fn session_bits_round_trip_and_close_only_their_generation() {
+        set_hook_session(41, SwitchMode::Window);
+        assert_eq!(hook_session(), Some((41, SwitchMode::Window)));
+        assert!(!close_hook_session(40));
+        assert_eq!(hook_session(), Some((41, SwitchMode::Window)));
+        assert!(close_hook_session(41));
+        assert_eq!(hook_session(), None);
+        assert!(!close_hook_session(41));
     }
 }

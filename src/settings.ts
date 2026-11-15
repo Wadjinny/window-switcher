@@ -27,9 +27,9 @@ const CHOICE_KEYS = Object.keys(CHOICES) as ChoiceKey[];
 const DEFAULT_STATUS = "Changes apply and save immediately.";
 
 const status = document.querySelector<HTMLElement>("#status")!;
+const hotkeyLive = document.querySelector<HTMLElement>("#hotkey-live")!;
 
 let current: Settings = {};
-let busy = false;
 
 function isChoiceKey(value: string): value is ChoiceKey {
   return (CHOICE_KEYS as string[]).includes(value);
@@ -168,12 +168,8 @@ function validateRecorded(
   if (combo.key === null || !HOTKEY_KEYS_ALLOWED.some((name) => name === combo.key)) {
     return { error: `${combo.key_name} can't be used. Press Tab or \` (the key above Tab).` };
   }
-  const value = `${combo.alt ? "Alt" : "Win"}+${combo.key}`;
-  const other = otherHotkey(field);
-  if (current[other] === value) {
-    return { error: `${formatHotkey(value)} is already used by “${HOTKEY_LABELS[other]}”.` };
-  }
-  return { value };
+  // The other switcher's shortcut is fine: Rust swaps the two.
+  return { value: `${combo.alt ? "Alt" : "Win"}+${combo.key}` };
 }
 
 function setHotkeyError(key: HotkeyKey, message: string): void {
@@ -186,18 +182,23 @@ function renderHotkeys(settings: Settings): void {
   for (const [key, button] of hotkeyFields) {
     const isRecording = recording === key;
     button.classList.toggle("recording", isRecording);
-    button.setAttribute("aria-pressed", String(isRecording));
     button.textContent = isRecording ? "Press a shortcut…" : formatHotkey(settings[key]);
-    button.disabled = busy;
   }
-  resetButton.disabled = busy;
 }
 
 function setRecording(key: HotkeyKey | null): void {
   if (recording === key) return;
-  if (recording) setHotkeyError(recording, "");
+  const previous = recording;
+  if (previous) setHotkeyError(previous, "");
   recording = key;
   renderHotkeys(current);
+  // Announced through a live region: a toggle state on the button would not
+  // say what to do next.
+  if (key) {
+    hotkeyLive.textContent = `Recording a shortcut for ${HOTKEY_LABELS[key]}. Hold Alt or Win and press Tab or the key above Tab. Escape cancels.`;
+  } else if (previous) {
+    hotkeyLive.textContent = `Stopped recording. ${HOTKEY_LABELS[previous]} is ${formatHotkey(current[previous])}.`;
+  }
   invoke("set_hotkey_recording", { active: key !== null }).catch((error: unknown) => {
     console.error("Unable to toggle hotkey recording", error);
     recording = null;
@@ -208,7 +209,7 @@ function setRecording(key: HotkeyKey | null): void {
 
 function onRecorded(combo: RecordedHotkey): void {
   const field = recording;
-  if (!field || busy) return;
+  if (!field) return;
   const bare = !combo.alt && !combo.win && !combo.ctrl && !combo.shift;
   if (combo.escape && bare) {
     setRecording(null);
@@ -222,7 +223,15 @@ function onRecorded(combo: RecordedHotkey): void {
   }
   setRecording(null);
   if (current[field] === result.value) return;
-  void save(() => invoke<unknown>("set_setting", { key: field, value: result.value }), field);
+  const other = otherHotkey(field);
+  void save(() => invoke<unknown>("set_setting", { key: field, value: result.value }), field).then(
+    (before) => {
+      // Rust swaps the shortcuts when the other switcher already used it.
+      if (before && before[other] === result.value && current[other] !== result.value) {
+        setStatus(`Swapped: “${HOTKEY_LABELS[other]}” is now ${formatHotkey(current[other])}.`);
+      }
+    },
+  );
 }
 
 function isRecordedHotkey(value: unknown): value is RecordedHotkey {
@@ -249,8 +258,8 @@ resetButton.addEventListener("click", () => {
   void save(() => invoke<unknown>("reset_hotkeys"));
 });
 
-// Recording only makes sense while this window has focus (Rust also ignores
-// keys while it is in the background); clicking anywhere else cancels it.
+// Recording only makes sense while this window has focus (Rust also stops
+// it when the window loses focus); clicking anywhere else cancels it.
 window.addEventListener("blur", () => setRecording(null));
 document.addEventListener("pointerdown", (event) => {
   if (recording && !(event.target as Element | null)?.closest("button[data-hotkey]")) {
@@ -275,19 +284,32 @@ function render(settings: Settings): void {
   for (const renderer of RENDERERS) renderer(current);
 }
 
-function setBusy(value: boolean): void {
-  busy = value;
-  radios.forEach((radio) => (radio.disabled = value));
-  renderHotkeys(current);
+// Saves run one at a time, in the order they were made. Controls stay
+// enabled (disabling them would drop keyboard focus); a change made while an
+// earlier one is saving simply waits its turn.
+let saving: Promise<unknown> = Promise.resolve();
+
+/**
+ * Queues a settings command; inline errors go to `field` when it is a hotkey.
+ * Resolves with the settings as they were just before this command ran, or
+ * null if it failed.
+ */
+function save(command: () => Promise<unknown>, field?: HotkeyKey): Promise<Settings | null> {
+  const run = saving.then(() => runSave(command, field));
+  saving = run;
+  return run;
 }
 
-/** Runs a settings command; inline errors go to `field` when it is a hotkey. */
-async function save(command: () => Promise<unknown>, field?: HotkeyKey): Promise<void> {
-  setBusy(true);
+async function runSave(
+  command: () => Promise<unknown>,
+  field?: HotkeyKey,
+): Promise<Settings | null> {
+  const before = { ...current };
   try {
     render(parseSettings(await command()));
     if (field) setHotkeyError(field, "");
     setStatus("Saved.");
+    return before;
   } catch (error) {
     console.error("Unable to save the setting", error);
     if (field) {
@@ -297,8 +319,7 @@ async function save(command: () => Promise<unknown>, field?: HotkeyKey): Promise
       setStatus(`Could not save: ${String(error)}`, true);
     }
     await load();
-  } finally {
-    setBusy(false);
+    return null;
   }
 }
 
@@ -313,4 +334,6 @@ async function load(): Promise<void> {
 
 setStatus(DEFAULT_STATUS);
 renderHotkeys(current);
+// A previous Settings window may have closed mid-recording; start clean.
+void invoke("set_hotkey_recording", { active: false }).catch(() => {});
 void load();

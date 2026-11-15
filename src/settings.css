@@ -10,6 +10,9 @@
 }
 
 * { box-sizing: border-box; }
+
+/* The page never scrolls; `main.settings` is the one scroll container, so
+   the window can be any height and every section stays reachable. */
 html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
 
 body {
@@ -22,17 +25,22 @@ body {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  min-height: 100%;
-  padding: 18px 20px 16px;
+  height: 100vh;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  padding: 14px 14px 12px 20px;
 }
 
-/* New settings may outgrow the window: scroll rather than clip. */
-body { overflow-y: auto; }
-
-h1 {
-  margin: 0;
-  font-size: 18px;
-  font-weight: 600;
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .group {
@@ -42,10 +50,11 @@ h1 {
   margin: 0;
   padding: 0;
   border: 0;
+  min-width: 0;
 }
 
 legend {
-  margin-bottom: 8px;
+  margin-bottom: 4px;
   padding: 0 2px;
   color: rgba(255, 255, 255, .68);
   font-size: 12px;
@@ -53,27 +62,34 @@ legend {
   letter-spacing: .01em;
 }
 
+/* One card per group; its options are rows separated by dividers. */
+.card {
+  border: 1px solid rgba(255, 255, 255, .12);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, .12);
+  overflow: hidden;
+}
+
 .option {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 9px 12px;
-  border: 2px solid rgba(255, 255, 255, .1);
-  border-radius: 14px;
-  background: rgba(0, 0, 0, .12);
+  padding: 7px 12px;
+  border-left: 3px solid transparent;
   cursor: pointer;
-  transition: background-color 90ms ease, border-color 90ms ease, box-shadow 90ms ease;
+  transition: background-color 90ms ease, border-color 90ms ease;
 }
 
-.option:hover { background: rgba(255, 255, 255, .05); }
+.option + .option { border-top: 1px solid rgba(255, 255, 255, .08); }
+
+label.option:hover { background: rgba(255, 255, 255, .05); }
 
 .option:has(input:checked) {
-  border-color: #55c9ff;
-  background-color: rgba(31, 116, 151, .18);
-  box-shadow: 0 0 0 1px rgba(151, 227, 255, .26), 0 0 18px rgba(48, 188, 255, .14);
+  border-left-color: #55c9ff;
+  background-color: rgba(31, 116, 151, .2);
 }
 
-.option:has(input:focus-visible) { outline: 2px solid #97e3ff; outline-offset: 2px; }
+.option:has(input:focus-visible) { outline: 2px solid #97e3ff; outline-offset: -2px; }
 
 input[type="radio"] {
   flex: 0 0 auto;
@@ -89,7 +105,6 @@ input[type="radio"] {
 
 /* Shortcut rows: a text block and a key-combination field that records. */
 .hotkey-row { cursor: default; }
-.hotkey-row:hover { background: rgba(0, 0, 0, .12); }
 .hotkey-row .option-text { flex: 1 1 auto; }
 
 .hotkey {
@@ -110,7 +125,6 @@ input[type="radio"] {
 
 .hotkey:hover { background: rgba(255, 255, 255, .12); }
 .hotkey:focus-visible { outline: 2px solid #97e3ff; outline-offset: 2px; }
-.hotkey:disabled { opacity: .6; cursor: default; }
 
 .hotkey.recording {
   border-color: #55c9ff;
@@ -119,7 +133,7 @@ input[type="radio"] {
   box-shadow: 0 0 0 1px rgba(151, 227, 255, .26), 0 0 18px rgba(48, 188, 255, .18);
 }
 
-.hotkey-row:has(.hotkey.invalid) { border-color: rgba(255, 120, 120, .55); }
+.hotkey-row:has(.hotkey.invalid) { border-left-color: rgba(255, 120, 120, .75); }
 .hotkey-error { color: #ff9a9a; font-size: 11px; }
 .hotkey-error:empty { display: none; }
 
@@ -144,7 +158,6 @@ input[type="radio"] {
 
 .link-button:hover { text-decoration: underline; }
 .link-button:focus-visible { outline: 2px solid #97e3ff; outline-offset: 2px; }
-.link-button:disabled { opacity: .6; cursor: default; }
 
 .note {
   margin: auto 0 0;
@@ -155,6 +168,6 @@ input[type="radio"] {
 .note.error { color: #ff9a9a; }
 
 @media (forced-colors: active) {
-  .option { border-color: CanvasText; }
-  .option:has(input:checked) { border-color: Highlight; outline: 2px solid Highlight; }
+  .card { border-color: CanvasText; }
+  .option:has(input:checked) { border-left-color: Highlight; outline: 2px solid Highlight; outline-offset: -2px; }
 }
