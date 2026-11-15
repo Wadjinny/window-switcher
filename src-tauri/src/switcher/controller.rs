@@ -24,6 +24,7 @@ use super::{
     items::target_to_item_cached,
     session::{
         active_switcher, advance_switcher, cancel_generation, commit_switcher, emit_and_show,
+        select_switcher,
     },
     ActiveSwitcher, HookRuntime, SwitchMode, RUNTIME,
 };
@@ -72,6 +73,18 @@ pub(crate) enum Command {
     Cancel {
         generation: u64,
         reason: &'static str,
+    },
+    /// The mouse moved onto card `index` of opening `generation`.
+    Select {
+        generation: u64,
+        index: usize,
+    },
+    /// The mouse clicked card `index` of opening `generation`: commit it.
+    Click {
+        generation: u64,
+        index: usize,
+        /// When the click reached the backend, for the latency log.
+        at: Instant,
     },
     RecordKey(RecordedKey),
     /// Show the open switcher again (new overlays were created).
@@ -258,6 +271,25 @@ impl Controller {
                 }
                 log_hook_timing();
             }
+            Command::Select { generation, index } => {
+                select_switcher(self.runtime, generation, index);
+            }
+            Command::Click {
+                generation,
+                index,
+                at,
+            } => {
+                if commit_switcher(self.runtime, generation, Some(index), at) {
+                    log::info!(
+                        "switcher committed by mouse click on thread {:?}",
+                        std::thread::current().name().unwrap_or("unnamed")
+                    );
+                }
+                if active_switcher(self.runtime).is_none() {
+                    self.stop_watchdog();
+                    self.refresh_app_hint();
+                }
+            }
             Command::RecordKey(key) => emit_recorded_hotkey(self.runtime, &key),
             Command::Reshow => emit_and_show(self.runtime, &mut None),
         }
@@ -270,7 +302,9 @@ impl Controller {
         let mut commits = false;
         for command in &self.pending {
             match command {
-                Command::Commit { generation: g, .. } if *g == generation => {
+                Command::Commit { generation: g, .. } | Command::Click { generation: g, .. }
+                    if *g == generation =>
+                {
                     closes = true;
                     commits = true;
                 }

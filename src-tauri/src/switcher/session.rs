@@ -14,7 +14,7 @@ use crate::{
     ipc::{SelectionPayload, SwitcherPayload},
     lock_unpoisoned,
     overlay::{hide_overlay, show_overlay},
-    targets::activate::activate_window,
+    targets::{activate::activate_window, Target},
     timing,
 };
 
@@ -152,6 +152,26 @@ pub(crate) fn commit_index(
     }
 }
 
+/// Ends session `generation` for a commit and returns its targets and the
+/// index to activate, or `None` (leaving the state alone) when the commit
+/// does not apply — see `commit_index`. A session can only be taken once, so
+/// a click and the modifier release that follows never both commit. Pure, so
+/// it is unit tested.
+pub(crate) fn take_commit(
+    state: &mut SwitcherState,
+    generation: u64,
+    clicked: Option<usize>,
+) -> Option<(Vec<Target>, usize)> {
+    let selected = state
+        .active
+        .as_ref()
+        .and_then(|active| commit_index(active, generation, clicked))?;
+    state
+        .active
+        .take_if(|active| active.generation == generation)
+        .map(|active| (active.targets, selected))
+}
+
 /// Commits the switcher: activates the selected window and hides the
 /// overlay. `clicked` is the card the mouse clicked, overriding the current
 /// selection (an out-of-range click leaves the session alone). Returns
@@ -176,16 +196,11 @@ pub(crate) fn commit_switcher(
     timing::mark(&mut watch, "dequeued");
     let selection = {
         let _visibility = lock_overlay_visibility();
-        let selection = runtime.state.lock().ok().and_then(|mut state| {
-            let selected = state
-                .active
-                .as_ref()
-                .and_then(|active| commit_index(active, generation, clicked))?;
-            state
-                .active
-                .take_if(|active| active.generation == generation)
-                .map(|active| (active.targets, selected))
-        });
+        let selection = runtime
+            .state
+            .lock()
+            .ok()
+            .and_then(|mut state| take_commit(&mut state, generation, clicked));
         if selection.is_some() {
             // The click, not a modifier release, is ending this session: the
             // release that follows must not try to commit it a second time.
@@ -203,9 +218,6 @@ pub(crate) fn commit_switcher(
     };
     if targets.is_empty() {
         return false;
-    }
-    if clicked.is_some() {
-        log::info!("switcher committed by mouse click");
     }
     // A window can disappear between enumeration and activation; walk forward
     // to the next card instead of silently doing nothing.
@@ -282,7 +294,6 @@ mod tests {
     use crate::{
         ipc::SwitchItem,
         settings_model::{CardStyle, Layout},
-        targets::Target,
     };
     use windows::Win32::Foundation::HWND;
 
@@ -351,5 +362,39 @@ mod tests {
         assert_eq!(commit_index(&active, 7, Some(3)), None);
         // So does a click on a session that is no longer on screen.
         assert_eq!(commit_index(&active, 6, Some(2)), None);
+    }
+
+    #[test]
+    fn a_click_then_the_release_commits_only_once() {
+        let mut state = SwitcherState {
+            active: Some(active(7, 3, 0)),
+        };
+        // The click commits the clicked card and ends the session...
+        let (targets, index) = take_commit(&mut state, 7, Some(2)).expect("click commits");
+        assert_eq!((targets.len(), index), (3, 2));
+        assert!(state.active.is_none());
+        // ...so the modifier release that follows finds nothing to commit.
+        assert!(take_commit(&mut state, 7, None).is_none());
+    }
+
+    #[test]
+    fn a_release_then_a_late_click_commits_only_once() {
+        let mut state = SwitcherState {
+            active: Some(active(7, 3, 1)),
+        };
+        assert_eq!(take_commit(&mut state, 7, None).map(|(_, i)| i), Some(1));
+        assert!(take_commit(&mut state, 7, Some(2)).is_none());
+    }
+
+    #[test]
+    fn a_rejected_click_leaves_the_session_open() {
+        let mut state = SwitcherState {
+            active: Some(active(7, 3, 1)),
+        };
+        assert!(take_commit(&mut state, 7, Some(5)).is_none());
+        assert!(take_commit(&mut state, 6, Some(0)).is_none());
+        assert!(state.active.is_some());
+        // The release still commits the keyboard selection.
+        assert_eq!(take_commit(&mut state, 7, None).map(|(_, i)| i), Some(1));
     }
 }

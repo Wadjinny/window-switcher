@@ -19,7 +19,8 @@ use crate::{
     },
     settings_window::{settings_is_foreground, RECORDING_HOTKEY},
     switcher::{
-        session::{commit_switcher, payload_snapshot, select_switcher},
+        controller::{post_command, Command},
+        session::payload_snapshot,
         RUNTIME,
     },
     thumbnails, timing,
@@ -101,31 +102,29 @@ pub(crate) fn switcher_snapshot() -> Option<SwitcherPayload> {
 
 /// The mouse moved over a card: select it. The overlay stays where it is —
 /// only the selection highlight moves — and the new index is sent to every
-/// overlay, so keyboard cycling and the mouse stay in sync. Returns whether
-/// the selection changed.
+/// overlay, so keyboard cycling and the mouse stay in sync. Posted to the
+/// controller thread, which owns the session, so the main thread never
+/// waits on the session lock.
 #[tauri::command]
-pub(crate) fn switcher_select(generation: u64, index: u32) -> bool {
-    let Some(runtime) = RUNTIME.get() else {
-        return false;
-    };
-    select_switcher(runtime, generation, index as usize)
+pub(crate) fn switcher_select(generation: u64, index: u32) {
+    post_command(Command::Select {
+        generation,
+        index: index as usize,
+    });
 }
 
 /// The mouse clicked a card: commit that target immediately, even while the
-/// switcher's modifier is still held. The release that follows finds the
-/// session already closed (the hook's record of it is dropped on the way),
-/// so it cannot commit a second time. Returns whether it committed.
+/// switcher's modifier is still held. Posted to the controller thread like a
+/// modifier release, so activating the window never runs on the main thread
+/// and a click and the release that follows are handled one after the
+/// other: whichever comes first commits, the other finds the session closed.
 #[tauri::command]
-pub(crate) fn switcher_click(generation: u64, index: u32) -> bool {
-    let Some(runtime) = RUNTIME.get() else {
-        return false;
-    };
-    commit_switcher(
-        runtime,
+pub(crate) fn switcher_click(generation: u64, index: u32) {
+    post_command(Command::Click {
         generation,
-        Some(index as usize),
-        std::time::Instant::now(),
-    )
+        index: index as usize,
+        at: std::time::Instant::now(),
+    });
 }
 
 /// Every setting the Settings window shows, keyed like `config.json`.

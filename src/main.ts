@@ -10,6 +10,7 @@ import {
   type SwitchItem,
   type SwitcherPayload,
 } from "./payload";
+import { HoverGate } from "./hover-gate";
 import { previewScale } from "./preview-fit";
 import "./style.css";
 
@@ -427,20 +428,50 @@ function markSelection(view: View, selected: number): void {
  * held. The generation is echoed so a hover or click reported late (by an
  * overlay that already closed) can never touch a newer session. */
 function attachCardMouse(view: View, card: CardView, index: number): void {
-  card.element.addEventListener("mouseenter", () => {
-    // Keyboard cycling keeps working; the mouse only takes over when it
-    // actually moves onto a different card.
-    if (card.element.classList.contains("selected")) return;
-    void invoke("switcher_select", { generation: view.generation, index }).catch(
-      (error: unknown) => console.warn("Unable to select from the mouse", error),
-    );
-  });
+  card.element.dataset.index = String(index);
   card.element.addEventListener("click", () => {
+    // Clicks always count, moved or not.
     void invoke("switcher_click", { generation: view.generation, index }).catch(
       (error: unknown) => console.warn("Unable to commit from the mouse", error),
     );
   });
 }
+
+/** Hover only selects after the pointer really moved in this opening (see
+ * hover-gate.ts), and only when it enters a different card: keyboard cycling
+ * keeps working while the mouse rests on a card. */
+const hoverGate = new HoverGate();
+/** The card the pointer is over, or -1; selecting happens on a change. */
+let hoveredIndex = -1;
+
+function resetHover(): void {
+  hoverGate.reset();
+  hoveredIndex = -1;
+}
+
+function cardIndexAt(target: EventTarget | null): number {
+  if (!(target instanceof Element)) return -1;
+  const element = target.closest<HTMLElement>(".item");
+  const index = element ? Number(element.dataset.index) : -1;
+  return Number.isInteger(index) ? index : -1;
+}
+
+document.addEventListener("pointermove", (event) => {
+  const view = current;
+  if (!hoverGate.move(event.screenX, event.screenY) || !view) return;
+  const index = cardIndexAt(event.target);
+  if (index === hoveredIndex) return;
+  hoveredIndex = index;
+  const card = view.cards[index];
+  if (!card || card.element.classList.contains("selected")) return;
+  void invoke("switcher_select", { generation: view.generation, index }).catch(
+    (error: unknown) => console.warn("Unable to select from the mouse", error),
+  );
+});
+
+document.documentElement.addEventListener("pointerleave", () => {
+  hoveredIndex = -1;
+});
 
 // ---------------------------------------------------------------------------
 // Window previews
@@ -516,6 +547,7 @@ function render(payload: SwitcherPayload): void {
   renderPayload(payload);
   if (payload.generation !== renderedGeneration) {
     renderedGeneration = payload.generation;
+    resetHover();
     markOpening();
   }
   if (payload.card_style === "preview") scheduleThumbnailReport();
