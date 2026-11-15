@@ -1,0 +1,21 @@
+{
+  "name": "window-switcher",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "tauri": "tauri",
+    "release": "tauri build",
+    "install:local": "powershell -NoProfile -ExecutionPolicy Bypass -File \"./scripts/install.ps1\""
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0"
+  }
+}

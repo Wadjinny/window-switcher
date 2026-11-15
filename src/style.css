@@ -1,0 +1,366 @@
+:root {
+  /* How long the selection highlight takes to move between cards. The
+     overlay itself has no open/close animation: it appears and disappears in
+     one frame (Windows' window transition is disabled in main.rs). */
+  --selection-ms: 90ms;
+  color: #fff;
+  background: transparent;
+  font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+
+/* The panel fills the overlay window. Content is sized to fit 205px:
+   15px pad + 19px caption + 9px gap + 132px cards + 14px pad + 2px border. */
+.switcher {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  width: 100%;
+  height: 100%;
+  padding: 15px 18px 14px;
+  background:
+    linear-gradient(135deg, rgba(68, 68, 68, .96), rgba(40, 40, 40, .97)),
+    rgba(42, 42, 42, .97);
+  border: 1px solid rgba(255, 255, 255, .13);
+  border-radius: 20px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .38), inset 0 1px rgba(255, 255, 255, .07);
+  overflow: hidden;
+}
+
+.caption {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 19px;
+  padding: 0 2px;
+  color: rgba(255, 255, 255, .68);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .01em;
+}
+
+.caption > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+kbd {
+  flex: 0 0 auto;
+  color: rgba(255, 255, 255, .76);
+  font: 600 11px/1 "Segoe UI Variable", sans-serif;
+  padding: 3px 6px;
+  border: 1px solid rgba(255, 255, 255, .18);
+  border-radius: 5px;
+  background: rgba(0, 0, 0, .15);
+}
+
+/* Wraps into rows; overflow-y is only the last-resort fallback for a window
+   that is taller than the monitor allows. Row pitch: 132px card + 13px gap. */
+.items {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 13px;
+  min-height: 0;
+  padding: 3px 2px 2px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, .28) transparent;
+}
+
+.items::-webkit-scrollbar { width: 6px; }
+.items::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, .24); border-radius: 999px; }
+.items::-webkit-scrollbar-track { background: transparent; }
+
+.item {
+  position: relative;
+  display: flex;
+  flex: 0 0 118px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  width: 118px;
+  height: 132px;
+  padding: 6px;
+  border: 3px solid transparent;
+  border-radius: 18px;
+  text-align: center;
+  overflow: hidden;
+  transition: background-color var(--selection-ms) ease, border-color var(--selection-ms) ease,
+    transform var(--selection-ms) ease, box-shadow var(--selection-ms) ease;
+}
+
+.item.selected {
+  border-color: #55c9ff;
+  background-color: rgba(31, 116, 151, .18);
+  box-shadow: 0 0 0 1px rgba(151, 227, 255, .26), 0 0 22px rgba(48, 188, 255, .18);
+  transform: translateY(-2px);
+}
+
+.window-count {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  min-width: 17px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .22);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.4;
+  text-align: center;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .35);
+}
+
+.item.selected .window-count {
+  background: #55c9ff;
+  color: #062a3a;
+}
+
+.focus-ring { height: 58px; display: grid; place-items: center; }
+
+/* Stack the image and the letter tile in one cell so hiding either one never
+   creates a second grid row. */
+.icon-shell {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  grid-template-areas: "icon";
+  place-items: center;
+}
+
+.icon-shell > * { grid-area: icon; }
+
+.icon-shell img {
+  width: 40px;
+  height: 40px;
+  object-fit: contain;
+  filter: drop-shadow(0 3px 4px rgba(0, 0, 0, .32));
+}
+
+.fallback-icon {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 11px;
+  color: white;
+  font-size: 21px;
+  font-weight: 700;
+  background: linear-gradient(145deg, color-mix(in srgb, var(--accent) 85%, white), var(--accent));
+  box-shadow: 0 3px 8px rgba(0, 0, 0, .32);
+}
+
+.title,
+.subtitle {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.title { color: #fff; font-size: 12px; font-weight: 600; line-height: 1.25; }
+.subtitle { color: rgba(255, 255, 255, .55); font-size: 10px; line-height: 1.3; }
+
+/* Preview cards (card_style "preview"). The backend draws a live DWM
+   thumbnail over each .thumb slot, above the HTML, so nothing may overlap a
+   slot: the selection border sits around it and the badge sits below it.
+   Full size is 240 x 178 (PREVIEW_CARD_PITCH / PREVIEW_ROW_HEIGHT in main.rs
+   add the 13px gap); --card-scale shrinks the slot when the monitor is too
+   small to fit every card. */
+.switcher.preview { --card-scale: 1; }
+
+.switcher.preview .item {
+  flex: 0 0 auto;
+  justify-content: flex-start;
+  gap: 6px;
+  width: calc(240px * var(--card-scale));
+  height: calc(46px + 132px * var(--card-scale));
+  border-radius: 14px;
+  /* The thumbnail is not animated with the card, so the card must not move. */
+  transition: background-color var(--selection-ms) ease, border-color var(--selection-ms) ease,
+    box-shadow var(--selection-ms) ease;
+}
+
+/* The first frame of each opening shows the selection in place: a reused
+   view would otherwise slide the highlight over from where the last opening
+   left it. */
+.switcher.opening .item { transition: none; }
+
+.switcher.preview .item.selected { transform: none; }
+
+.thumb {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 100%;
+  height: calc(132px * var(--card-scale));
+  border-radius: 8px;
+  background: rgba(0, 0, 0, .22);
+  overflow: hidden;
+}
+
+.thumb-fallback {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  color: rgba(255, 255, 255, .5);
+  font-size: 11px;
+}
+
+.thumb-fallback img {
+  width: min(48px, calc(56px * var(--card-scale)));
+  height: min(48px, calc(56px * var(--card-scale)));
+  object-fit: contain;
+  filter: drop-shadow(0 3px 4px rgba(0, 0, 0, .32));
+}
+
+.label-row {
+  display: flex;
+  flex: 0 0 22px;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-width: 0;
+  padding: 0 2px;
+}
+
+.label-row .icon-shell { flex: 0 0 auto; width: 20px; height: 20px; }
+.label-row .icon-shell img { width: 20px; height: 20px; filter: none; }
+
+.label-row .fallback-icon {
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
+  font-size: 11px;
+  box-shadow: none;
+}
+
+.label-row .title { flex: 1 1 auto; width: auto; min-width: 0; text-align: left; }
+.label-row .window-count { position: static; flex: 0 0 auto; }
+
+.status {
+  margin: 0;
+  color: rgba(255, 255, 255, .72);
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: center;
+}
+
+.items > .status { flex: 0 0 100%; width: 100%; padding: 8px 4px; }
+
+.switcher.status-panel { justify-content: center; }
+.switcher.empty { justify-content: center; }
+.switcher.empty .items { flex: 0 0 auto; overflow: visible; }
+
+@media (forced-colors: active) {
+  .switcher { border-color: CanvasText; }
+
+  .item.selected {
+    border-color: Highlight;
+    outline: 3px solid Highlight;
+    outline-offset: -4px;
+  }
+
+  .fallback-icon { border: 1px solid CanvasText; }
+}
+
+/* Vertical layout ("layout": "vertical"): each card is a row of a list.
+   Rows fill a column top to bottom, then wrap into the next column; the
+   overlay is sized for that in main.rs (VERTICAL_* constants), so keep the
+   row sizes here in sync. Icon rows are 340 x 46 with a 4px gap. */
+.switcher.vertical .items {
+  flex-direction: column;
+  flex-wrap: wrap;
+  align-content: safe center;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 4px 13px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.switcher.vertical .items::-webkit-scrollbar { height: 6px; }
+
+.switcher.vertical .item {
+  display: grid;
+  flex: 0 0 auto;
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  grid-template-rows: auto auto;
+  align-content: center;
+  align-items: center;
+  column-gap: 10px;
+  row-gap: 0;
+  width: 340px;
+  height: 46px;
+  padding: 4px 8px;
+  border-radius: 12px;
+  text-align: left;
+}
+
+.switcher.vertical .item.selected { transform: none; }
+
+.switcher.vertical .focus-ring { grid-column: 1; grid-row: 1 / span 2; width: 32px; height: 32px; }
+.switcher.vertical .focus-ring .icon-shell { width: 32px; height: 32px; }
+.switcher.vertical .focus-ring .icon-shell img { width: 30px; height: 30px; }
+
+.switcher.vertical .focus-ring .fallback-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  font-size: 16px;
+}
+
+.switcher.vertical .item > .title { grid-column: 2; grid-row: 1; font-size: 13px; }
+.switcher.vertical .item > .subtitle { grid-column: 2; grid-row: 2; font-size: 11px; }
+.switcher.vertical .item.no-subtitle > .subtitle { display: none; }
+
+.switcher.vertical .item > .window-count {
+  position: static;
+  grid-column: 3;
+  grid-row: 1 / span 2;
+  align-self: center;
+}
+
+/* Vertical preview rows: a 176 x 99 live thumbnail beside a 198px label,
+   404 x 117 at full size with an 8px gap. --card-scale shrinks the
+   thumbnail (the label keeps its width) when the columns would not fit. */
+.switcher.vertical.preview .items { gap: 8px 13px; }
+
+.switcher.vertical.preview .item {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 12px;
+  width: calc(228px + 176px * var(--card-scale));
+  height: calc(18px + 99px * var(--card-scale));
+  padding: 6px;
+}
+
+.switcher.vertical.preview .thumb {
+  width: calc(176px * var(--card-scale));
+  height: calc(99px * var(--card-scale));
+  border-radius: 6px;
+}
+
+.switcher.vertical.preview .label-row { flex: 1 1 0; min-width: 0; }
+.switcher.vertical.preview .label-row .title { font-size: 13px; }
