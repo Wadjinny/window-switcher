@@ -1,130 +1,19 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import {
+  checkIconSource,
+  parsePayload,
+  parseSelection,
+  type CardStyle,
+  type Layout,
+  type Mode,
+  type SwitchItem,
+  type SwitcherPayload,
+} from "./payload";
+import { previewScale } from "./preview-fit";
 import "./style.css";
 
-type Mode = "window" | "app";
-type CardStyle = "icon" | "preview";
-type Layout = "horizontal" | "vertical";
-
-type SwitchItem = {
-  id: number;
-  title: string;
-  subtitle: string;
-  icon: string | null;
-  accent: string;
-  window_count: number;
-  /** Preview style: the backend draws a live thumbnail of window `id` here. */
-  thumbnail: boolean;
-};
-
-type SwitcherPayload = {
-  mode: Mode;
-  selected: number;
-  items: SwitchItem[];
-  hint: string;
-  card_style: CardStyle;
-  layout: Layout;
-  generation: number;
-  /** Latency logging is on in the backend: report render and paint times. */
-  timing: boolean;
-  /** Latency logging only: Unix ms when the backend sent this event. */
-  sent_at: number | null;
-};
-
 const app = document.querySelector<HTMLElement>("#app")!;
-
-const DEFAULT_ACCENT = "#2678d9";
-const DEFAULT_HINTS: Record<Mode, string> = {
-  window: "Alt + `",
-  app: "Win + Tab",
-};
-
-// Icons are untrusted input: only allow raster data URIs (never SVG or a
-// remote URL), and cap their size so a bad payload cannot bloat the DOM.
-const ICON_DATA_URI =
-  /^data:image\/(?:png|jpe?g|webp|gif|bmp|x-icon|vnd\.microsoft\.icon)(?:;[a-z0-9.+-]+=[^;,]*)*;base64,[a-z0-9+/=\s]+$/i;
-const MAX_ICON_LENGTH = 1_000_000;
-
-// ---------------------------------------------------------------------------
-// Payload validation
-// ---------------------------------------------------------------------------
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function parseItem(value: unknown): SwitchItem | null {
-  if (!isRecord(value)) return null;
-  const { id } = value;
-  if (typeof id !== "number" || !Number.isFinite(id)) return null;
-
-  const rawTitle = typeof value.title === "string" ? value.title : "";
-  const rawSubtitle = typeof value.subtitle === "string" ? value.subtitle : "";
-  const title = rawTitle || rawSubtitle;
-  if (!title) return null;
-
-  const accent =
-    typeof value.accent === "string" && value.accent.trim().length > 0
-      ? value.accent.trim()
-      : DEFAULT_ACCENT;
-
-  const rawCount = value.window_count;
-  const windowCount =
-    typeof rawCount === "number" && Number.isFinite(rawCount)
-      ? Math.max(1, Math.trunc(rawCount))
-      : 1;
-
-  return {
-    id,
-    title,
-    subtitle: rawSubtitle,
-    icon: typeof value.icon === "string" ? value.icon : null,
-    accent,
-    window_count: windowCount,
-    thumbnail: value.thumbnail === true,
-  };
-}
-
-function parsePayload(value: unknown): SwitcherPayload | null {
-  if (!isRecord(value)) return null;
-  const { mode } = value;
-  if (mode !== "window" && mode !== "app") return null;
-
-  const rawItems = value.items;
-  if (!Array.isArray(rawItems)) return null;
-
-  const items: SwitchItem[] = [];
-  for (const entry of rawItems) {
-    const item = parseItem(entry);
-    // One malformed row means the selection index can no longer be trusted.
-    if (!item) return null;
-    items.push(item);
-  }
-
-  const rawSelected =
-    typeof value.selected === "number" && Number.isFinite(value.selected)
-      ? Math.trunc(value.selected)
-      : 0;
-  const selected =
-    items.length === 0 ? 0 : Math.min(Math.max(rawSelected, 0), items.length - 1);
-
-  const hint =
-    typeof value.hint === "string" && value.hint.trim().length > 0
-      ? value.hint
-      : DEFAULT_HINTS[mode];
-
-  const card_style: CardStyle = value.card_style === "preview" ? "preview" : "icon";
-  const layout: Layout = value.layout === "vertical" ? "vertical" : "horizontal";
-  const generation =
-    typeof value.generation === "number" && Number.isFinite(value.generation)
-      ? value.generation
-      : 0;
-
-  const timing = value.timing === true;
-  const sent_at = typeof value.sent_at === "number" ? value.sent_at : null;
-
-  return { mode, selected, items, hint, card_style, layout, generation, timing, sent_at };
-}
 
 // The same icon strings arrive with every opening; checking a large data URI
 // against the pattern each time is wasted work, so results are remembered.
@@ -143,11 +32,7 @@ function safeIconSource(icon: string | null): string | null {
   if (icon === null) return null;
   const known = checkedIcons.get(icon);
   if (known !== undefined) return known;
-  const source = icon.trim();
-  const safe =
-    source.length > 0 && source.length <= MAX_ICON_LENGTH && ICON_DATA_URI.test(source)
-      ? source
-      : null;
+  const safe = checkIconSource(icon);
   remember(checkedIcons, icon, safe);
   return safe;
 }
@@ -537,36 +422,6 @@ function markSelection(view: View, selected: number): void {
 // Window previews
 // ---------------------------------------------------------------------------
 
-// Mirrors `.switcher.preview .item` in style.css and PREVIEW_CARD_PITCH /
-// PREVIEW_ROW_HEIGHT in main.rs: a card is 240px wide and 46px of chrome plus
-// a 132px preview tall at full size, with a 13px gap.
-const PREVIEW_CARD_WIDTH = 240;
-const PREVIEW_CARD_CHROME = 46;
-const PREVIEW_SLOT_HEIGHT = 132;
-const PREVIEW_GAP = 13;
-const MIN_PREVIEW_SCALE = 0.3;
-
-// Vertical preview rows (`.switcher.vertical.preview .item`, and
-// VERTICAL_PREVIEW_* in main.rs): a 176x99 thumbnail beside a 210px label;
-// 18px of border and padding around it, 8px between rows, 13px between
-// columns.
-const VERTICAL_THUMB_WIDTH = 176;
-const VERTICAL_THUMB_HEIGHT = 99;
-const VERTICAL_ROW_CHROME = 18;
-const VERTICAL_ROW_LABEL = 210;
-const VERTICAL_ROW_GAP = 8;
-const VERTICAL_COLUMN_GAP = 13;
-
-/** Vertical layout: rows fill a column top to bottom, then wrap into the
- * next column, so find the largest scale whose columns fit the width. */
-function verticalPreviewFits(scale: number, count: number, width: number, height: number): boolean {
-  const rowHeight = VERTICAL_ROW_CHROME + VERTICAL_THUMB_HEIGHT * scale;
-  const rowWidth = VERTICAL_ROW_CHROME + VERTICAL_ROW_LABEL + VERTICAL_THUMB_WIDTH * scale;
-  const rows = Math.max(1, Math.floor((height + VERTICAL_ROW_GAP + 0.5) / (rowHeight + VERTICAL_ROW_GAP)));
-  const columns = Math.ceil(count / rows);
-  return columns * rowWidth + (columns - 1) * VERTICAL_COLUMN_GAP <= width + 0.5;
-}
-
 /** Shrinks the preview cards until every card fits without scrolling: a
  * live thumbnail cannot be clipped by an HTML scroll container. */
 function fitPreviewCards(view: View): void {
@@ -575,21 +430,8 @@ function fitPreviewCards(view: View): void {
     view.items.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
   const height =
     view.items.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
-  const count = view.cards.length;
-
-  let scale = 1;
-  for (; scale > MIN_PREVIEW_SCALE; scale -= 0.025) {
-    if (view.layout === "vertical") {
-      if (verticalPreviewFits(scale, count, width, height)) break;
-      continue;
-    }
-    const cardWidth = PREVIEW_CARD_WIDTH * scale;
-    const cardHeight = PREVIEW_CARD_CHROME + PREVIEW_SLOT_HEIGHT * scale;
-    const columns = Math.max(1, Math.floor((width + PREVIEW_GAP) / (cardWidth + PREVIEW_GAP)));
-    const rows = Math.ceil(count / columns);
-    if (rows * cardHeight + (rows - 1) * PREVIEW_GAP <= height + 0.5) break;
-  }
-  view.section.style.setProperty("--card-scale", String(Math.max(scale, MIN_PREVIEW_SCALE)));
+  const scale = previewScale(view.layout, view.cards.length, width, height);
+  view.section.style.setProperty("--card-scale", String(scale));
 }
 
 let lastThumbnailReport = "";
@@ -759,17 +601,6 @@ function reportOpeningTimes(generation: number, arrived: number): void {
     report("painted");
     void Promise.allSettled(decodes).then(() => report(`icons drawn (${decodes.length})`));
   });
-}
-
-type SelectionPayload = { generation: number; selected: number; sent_at: number | null };
-
-function parseSelection(value: unknown): SelectionPayload | null {
-  if (!isRecord(value)) return null;
-  const { generation, selected } = value;
-  if (typeof generation !== "number" || !Number.isFinite(generation)) return null;
-  if (typeof selected !== "number" || !Number.isInteger(selected)) return null;
-  const sent_at = typeof value.sent_at === "number" ? value.sent_at : null;
-  return { generation, selected, sent_at };
 }
 
 /** The backend only moved the selection within the opening on screen. */
