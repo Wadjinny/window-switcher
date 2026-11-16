@@ -125,3 +125,7 @@ Both values accept a modifier and a key joined by `+`. Matching is case-insensit
 The easiest way to change them is the tray menu's **Settings…** window: click a shortcut, then hold Alt or Win and press Tab or the backtick key (Esc cancels). It rejects combinations the hook cannot use (Ctrl, Shift, other keys, the same shortcut twice), applies the new hotkeys immediately and writes them here. **Reset to defaults** restores the values above.
 
 If you edit the file by hand instead, restart the application - the file is read once at startup.
+
+## License
+
+[MIT](LICENSE)
