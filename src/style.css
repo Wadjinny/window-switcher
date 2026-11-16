@@ -106,6 +106,10 @@ kbd {
     transform var(--selection-ms) ease, box-shadow var(--selection-ms) ease;
 }
 
+/* Hover is only a hint of what a click would pick: a faint wash, no border,
+   so it never reads as the selection. */
+.item:not(.selected):hover { background-color: rgba(255, 255, 255, .06); }
+
 .item.selected {
   border-color: #55c9ff;
   background-color: rgba(31, 116, 151, .18);

@@ -4,7 +4,7 @@
 const COMMANDS: &[&str] = &[
     // The switcher overlays.
     "switcher_snapshot",
-    "switcher_select",
+    "switcher_grid",
     "switcher_click",
     "update_thumbnails",
     "overlay_timing",

@@ -70,7 +70,7 @@ fn main() {
         .plugin(log_plugin)
         .invoke_handler(tauri::generate_handler![
             ipc::switcher_snapshot,
-            ipc::switcher_select,
+            ipc::switcher_grid,
             ipc::switcher_click,
             ipc::get_settings,
             ipc::set_setting,

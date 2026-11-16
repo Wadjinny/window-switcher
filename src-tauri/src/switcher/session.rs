@@ -8,12 +8,13 @@ use std::{
 
 use tauri::Emitter;
 
-use super::{ActiveSwitcher, HookRuntime, SwitcherState};
+use super::{ActiveSwitcher, Direction, HookRuntime, SwitcherState};
 use crate::{
     input::hook::close_hook_session,
     ipc::{SelectionPayload, SwitcherPayload},
     lock_unpoisoned,
     overlay::{hide_overlay, show_overlay},
+    settings_model::Layout,
     targets::{activate::activate_window, Target},
     timing,
 };
@@ -47,43 +48,90 @@ pub(crate) fn advance_switcher(
     emit_selection(runtime, watch);
 }
 
-/// Whether hovering card `index` may change session `generation`'s
-/// selection: the session must still be the one on screen, the index must
-/// fall inside its targets, and the card must not already be selected. Pure,
-/// so it is unit tested.
-pub(crate) fn apply_mouse_selection(
-    active: &mut ActiveSwitcher,
-    generation: u64,
-    index: usize,
-) -> bool {
-    if active.generation != generation || index >= active.targets.len() || active.selected == index
-    {
-        return false;
+/// The card an arrow key moves the selection to, like Windows' own Alt+Tab.
+/// The cards are laid out in lines of `per_line` cards: rows in the
+/// horizontal layout, columns in the vertical one (which fills a column top
+/// to bottom, then wraps into the next). The arrows along a line (Left/Right
+/// horizontally, Up/Down vertically) step to the previous/next card and wrap
+/// around. The arrows across lines (Up/Down horizontally, Left/Right
+/// vertically) move one line, keeping the position in it, and stop at the
+/// first and last line; into a shorter last line they land on its last card,
+/// and with a single line (or `per_line` not reported yet) they do nothing.
+/// Pure, so it is unit tested.
+pub(crate) fn navigate_index(
+    selected: usize,
+    count: usize,
+    per_line: usize,
+    layout: Layout,
+    direction: Direction,
+) -> usize {
+    if count == 0 {
+        return selected;
     }
-    active.selected = index;
-    true
+    let per_line = if per_line == 0 {
+        count
+    } else {
+        per_line.min(count)
+    };
+    let (back, forward) = match layout {
+        Layout::Horizontal => (Direction::Left, Direction::Right),
+        Layout::Vertical => (Direction::Up, Direction::Down),
+    };
+    let previous_line = match (layout, direction) {
+        (Layout::Horizontal, Direction::Up) | (Layout::Vertical, Direction::Left) => true,
+        (Layout::Horizontal, Direction::Down) | (Layout::Vertical, Direction::Right) => false,
+        _ if direction == back => return (selected + count - 1) % count,
+        _ if direction == forward => return (selected + 1) % count,
+        _ => return selected,
+    };
+    if previous_line {
+        selected.checked_sub(per_line).unwrap_or(selected)
+    } else if selected / per_line < (count - 1) / per_line {
+        (selected + per_line).min(count - 1)
+    } else {
+        selected
+    }
 }
 
-/// The mouse moved over a card: select it and send the new selection to the
-/// overlays, without re-showing or resizing them. Returns whether anything
-/// changed.
-pub(crate) fn select_switcher(runtime: &HookRuntime, generation: u64, index: usize) -> bool {
-    let changed = runtime
-        .state
-        .lock()
-        .ok()
-        .and_then(|mut state| {
-            state
-                .active
-                .as_mut()
-                .map(|active| apply_mouse_selection(active, generation, index))
-        })
-        .unwrap_or(false);
-    if changed {
-        emit_selection(runtime, &mut None);
-        log::debug!("mouse hover selected card {index} of #{generation}");
+/// An arrow key: move the selection of session `generation` (see
+/// `navigate_index`) and send it to the overlays when it changed.
+pub(crate) fn navigate_switcher(
+    runtime: &HookRuntime,
+    generation: u64,
+    direction: Direction,
+    watch: &mut Option<timing::Stopwatch>,
+) {
+    if let Ok(mut state) = runtime.state.lock() {
+        match &mut state.active {
+            Some(active) if active.generation == generation && !active.targets.is_empty() => {
+                let selected = navigate_index(
+                    active.selected,
+                    active.targets.len(),
+                    active.per_line,
+                    active.layout,
+                    direction,
+                );
+                if selected == active.selected {
+                    return;
+                }
+                active.selected = selected;
+            }
+            _ => return,
+        }
     }
-    changed
+    emit_selection(runtime, watch);
+}
+
+/// The overlay reported how many cards fit in one line (row, or column in
+/// the vertical layout) of session `generation`.
+pub(crate) fn set_switcher_per_line(runtime: &HookRuntime, generation: u64, per_line: usize) {
+    if let Ok(mut state) = runtime.state.lock() {
+        if let Some(active) = state.active.as_mut() {
+            if active.generation == generation {
+                active.per_line = per_line;
+            }
+        }
+    }
 }
 
 /// Only the selection moved: send just the new index. The overlay is already
@@ -291,10 +339,7 @@ pub(crate) fn emit_and_show(runtime: &HookRuntime, watch: &mut Option<timing::St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        ipc::SwitchItem,
-        settings_model::{CardStyle, Layout},
-    };
+    use crate::{ipc::SwitchItem, settings_model::CardStyle};
     use windows::Win32::Foundation::HWND;
 
     fn target() -> Target {
@@ -318,32 +363,89 @@ mod tests {
             targets: (0..count).map(|_| target()).collect(),
             items: Vec::<SwitchItem>::new(),
             selected,
+            per_line: 0,
         }
     }
 
     #[test]
-    fn hovering_a_card_selects_it() {
-        let mut active = active(7, 3, 0);
-        assert!(apply_mouse_selection(&mut active, 7, 2));
-        assert_eq!(active.selected, 2);
-        // Selecting the card the mouse already sits on changes nothing, so
-        // no selection event is emitted for it.
-        assert!(!apply_mouse_selection(&mut active, 7, 2));
-        assert_eq!(active.selected, 2);
+    fn left_and_right_step_through_the_cards_and_wrap() {
+        let layout = Layout::Horizontal;
+        assert_eq!(navigate_index(0, 5, 3, layout, Direction::Right), 1);
+        assert_eq!(navigate_index(4, 5, 3, layout, Direction::Right), 0);
+        assert_eq!(navigate_index(0, 5, 3, layout, Direction::Left), 4);
+        assert_eq!(navigate_index(3, 5, 3, layout, Direction::Left), 2);
+        // One card: nothing to move to, and no card list at all is harmless.
+        assert_eq!(
+            navigate_index(0, 1, 0, Layout::Horizontal, Direction::Right),
+            0
+        );
+        assert_eq!(
+            navigate_index(0, 0, 0, Layout::Horizontal, Direction::Left),
+            0
+        );
     }
 
     #[test]
-    fn hovering_ignores_a_stale_generation() {
-        let mut active = active(7, 3, 0);
-        assert!(!apply_mouse_selection(&mut active, 6, 1));
-        assert_eq!(active.selected, 0);
+    fn up_and_down_move_between_rows_of_the_grid() {
+        let nav =
+            |selected, direction| navigate_index(selected, 8, 3, Layout::Horizontal, direction);
+        // Rows: [0 1 2] [3 4 5] [6 7].
+        assert_eq!(nav(1, Direction::Down), 4);
+        assert_eq!(nav(4, Direction::Up), 1);
+        assert_eq!(nav(4, Direction::Down), 7);
+        // Into the shorter last row: its last card.
+        assert_eq!(nav(5, Direction::Down), 7);
+        // No wrap at the first and last rows.
+        assert_eq!(nav(1, Direction::Up), 1);
+        assert_eq!(nav(6, Direction::Down), 6);
+        assert_eq!(nav(7, Direction::Down), 7);
     }
 
     #[test]
-    fn hovering_ignores_an_out_of_range_index() {
-        let mut active = active(7, 3, 0);
-        assert!(!apply_mouse_selection(&mut active, 7, 3));
-        assert_eq!(active.selected, 0);
+    fn up_and_down_do_nothing_in_a_single_row() {
+        for per_line in [0, 4, 9] {
+            for direction in [Direction::Up, Direction::Down] {
+                assert_eq!(
+                    navigate_index(2, 4, per_line, Layout::Horizontal, direction),
+                    2
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn up_and_down_step_through_a_vertical_list_and_wrap() {
+        let nav = |selected, direction| navigate_index(selected, 8, 3, Layout::Vertical, direction);
+        // Down goes on into the next column, and wraps like Left/Right do
+        // horizontally.
+        assert_eq!(nav(1, Direction::Down), 2);
+        assert_eq!(nav(2, Direction::Down), 3);
+        assert_eq!(nav(7, Direction::Down), 0);
+        assert_eq!(nav(3, Direction::Up), 2);
+        assert_eq!(nav(0, Direction::Up), 7);
+    }
+
+    #[test]
+    fn left_and_right_move_between_columns_of_a_vertical_list() {
+        let nav = |selected, direction| navigate_index(selected, 8, 3, Layout::Vertical, direction);
+        // Columns: [0 1 2] [3 4 5] [6 7].
+        assert_eq!(nav(1, Direction::Right), 4);
+        assert_eq!(nav(4, Direction::Left), 1);
+        assert_eq!(nav(4, Direction::Right), 7);
+        // Into the shorter last column: its last card.
+        assert_eq!(nav(5, Direction::Right), 7);
+        // No wrap at the first and last columns.
+        assert_eq!(nav(1, Direction::Left), 1);
+        assert_eq!(nav(6, Direction::Right), 6);
+        // A single column (or no report yet): Left/Right do nothing.
+        for per_line in [0, 4] {
+            for direction in [Direction::Left, Direction::Right] {
+                assert_eq!(
+                    navigate_index(2, 4, per_line, Layout::Vertical, direction),
+                    2
+                );
+            }
+        }
     }
 
     #[test]

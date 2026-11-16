@@ -24,9 +24,9 @@ use super::{
     items::target_to_item_cached,
     session::{
         active_switcher, advance_switcher, cancel_generation, commit_switcher, emit_and_show,
-        select_switcher,
+        navigate_switcher, set_switcher_per_line,
     },
-    ActiveSwitcher, HookRuntime, SwitchMode, RUNTIME,
+    ActiveSwitcher, Direction, HookRuntime, SwitchMode, RUNTIME,
 };
 use crate::{
     hotkey::shortcut_for,
@@ -66,6 +66,12 @@ pub(crate) enum Command {
         reverse: bool,
         at: Instant,
     },
+    /// An arrow key moved the selection of opening `generation`.
+    Navigate {
+        generation: u64,
+        direction: Direction,
+        at: Instant,
+    },
     Commit {
         generation: u64,
         at: Instant,
@@ -74,10 +80,11 @@ pub(crate) enum Command {
         generation: u64,
         reason: &'static str,
     },
-    /// The mouse moved onto card `index` of opening `generation`.
-    Select {
+    /// The overlay of opening `generation` lays its cards out in lines
+    /// (rows, or columns in the vertical layout) of `per_line` cards.
+    Grid {
         generation: u64,
-        index: usize,
+        per_line: usize,
     },
     /// The mouse clicked card `index` of opening `generation`: commit it.
     Click {
@@ -271,9 +278,20 @@ impl Controller {
                 }
                 log_hook_timing();
             }
-            Command::Select { generation, index } => {
-                select_switcher(self.runtime, generation, index);
+            Command::Navigate {
+                generation,
+                direction,
+                at,
+            } => {
+                let mut watch = timing::Stopwatch::start_at("navigate", at);
+                timing::mark(&mut watch, "dequeued");
+                navigate_switcher(self.runtime, generation, direction, &mut watch);
+                timing::finish(watch, "");
             }
+            Command::Grid {
+                generation,
+                per_line,
+            } => set_switcher_per_line(self.runtime, generation, per_line),
             Command::Click {
                 generation,
                 index,
@@ -397,6 +415,7 @@ impl Controller {
                 targets,
                 items,
                 selected,
+                per_line: 0,
             });
         } else {
             return;

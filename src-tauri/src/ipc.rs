@@ -100,16 +100,17 @@ pub(crate) fn switcher_snapshot() -> Option<SwitcherPayload> {
     })
 }
 
-/// The mouse moved over a card: select it. The overlay stays where it is —
-/// only the selection highlight moves — and the new index is sent to every
-/// overlay, so keyboard cycling and the mouse stay in sync. Posted to the
+/// The overlay laid out opening `generation` with `per_line` cards per row
+/// (horizontal layout) or per column (vertical layout): the arrows that move
+/// across lines (Up/Down, or Left/Right in the vertical layout) move by that
+/// many cards. Only the frontend knows, since preview cards shrink to fit. Posted to the
 /// controller thread, which owns the session, so the main thread never
 /// waits on the session lock.
 #[tauri::command]
-pub(crate) fn switcher_select(generation: u64, index: u32) {
-    post_command(Command::Select {
+pub(crate) fn switcher_grid(generation: u64, per_line: u32) {
+    post_command(Command::Grid {
         generation,
-        index: index as usize,
+        per_line: per_line as usize,
     });
 }
 

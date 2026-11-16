@@ -1,13 +1,13 @@
 //! The hook's decision for one key event, kept pure so it is unit tested.
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_CONTROL, VK_ESCAPE, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL,
-    VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
+    VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU,
+    VK_RCONTROL, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_UP,
 };
 
 use crate::{
     hotkey::{Modifier, Shortcut},
-    switcher::SwitchMode,
+    switcher::{Direction, SwitchMode},
 };
 
 /// What the foreground window is, for the swallow decision.
@@ -44,6 +44,7 @@ pub(crate) enum Action {
     PassThrough,
     Open { mode: SwitchMode, reverse: bool },
     Advance { reverse: bool },
+    Navigate(Direction),
     Commit,
     Cancel,
     RecordKey,
@@ -172,6 +173,16 @@ pub(crate) fn decide_key(input: &KeyInput) -> Decision {
                 ..pass
             };
         }
+        // Arrow keys move the selection, like Windows' own Alt+Tab, and never
+        // reach the app in front while the switcher is open.
+        if let Some(direction) = arrow_direction(input.vk) {
+            return Decision {
+                action: Action::Navigate(direction),
+                swallow: true,
+                mask: true,
+                ..pass
+            };
+        }
     }
     // The window shortcut wins if both ever match the same key.
     let mode = if matches(SwitchMode::Window) {
@@ -196,6 +207,18 @@ pub(crate) fn decide_key(input: &KeyInput) -> Decision {
         mask: true,
         ..pass
     }
+}
+
+fn arrow_direction(vk: u32) -> Option<Direction> {
+    [
+        (VK_LEFT, Direction::Left),
+        (VK_RIGHT, Direction::Right),
+        (VK_UP, Direction::Up),
+        (VK_DOWN, Direction::Down),
+    ]
+    .iter()
+    .find(|(key, _)| key.0 as u32 == vk)
+    .map(|&(_, direction)| direction)
 }
 
 fn is_modifier_key(vk: u32) -> bool {
@@ -328,6 +351,49 @@ mod tests {
             ..open
         });
         assert_eq!(back.action, Action::Advance { reverse: true });
+    }
+
+    #[test]
+    fn arrows_navigate_an_open_session_and_are_swallowed() {
+        let open = KeyInput {
+            session: Some(SwitchMode::App),
+            ..base()
+        };
+        for (vk, direction) in [
+            (VK_LEFT, Direction::Left),
+            (VK_RIGHT, Direction::Right),
+            (VK_UP, Direction::Up),
+            (VK_DOWN, Direction::Down),
+        ] {
+            let decision = decide_key(&KeyInput {
+                vk: vk.0 as u32,
+                scan_code: 0,
+                ..open
+            });
+            assert_eq!(decision.action, Action::Navigate(direction));
+            assert!(decision.swallow && decision.mask && !decision.close_stale);
+        }
+        // Without a session (or after a missed release) arrows are ordinary.
+        let left = KeyInput {
+            vk: VK_LEFT.0 as u32,
+            scan_code: 0x4B,
+            ..base()
+        };
+        assert_eq!(decide_key(&left), Decision::PASS);
+        let stale = decide_key(&KeyInput {
+            session: Some(SwitchMode::App),
+            win: false,
+            ..left
+        });
+        assert!(stale.close_stale && !stale.swallow);
+        assert_eq!(stale.action, Action::PassThrough);
+        // Releasing an arrow passes through and keeps the session open.
+        let up = KeyInput {
+            down: false,
+            session: Some(SwitchMode::App),
+            ..left
+        };
+        assert_eq!(decide_key(&up), Decision::PASS);
     }
 
     #[test]

@@ -7,7 +7,8 @@ A Windows 11-style switcher built with Rust and Tauri. It replaces the two AutoH
 - `` Alt+` `` (and the matching French `Alt+²` key): cycle windows belonging to the current application.
 - `Shift` reverses the direction.
 - `Win+Tab`: cycle application groups, one card per application identity.
-- Release `Alt` / `Win` to activate the selected item; press `Esc` to cancel.
+- While the switcher is open, `←` / `→` move to the previous / next item (wrapping around), and `↑` / `↓` move between rows of the grid. In the vertical layout it is the other way round: `↑` / `↓` step through the list, and `←` / `→` move between its columns.
+- Release `Alt` / `Win` to activate the selected item; press `Esc` to cancel. Clicking an item activates it right away; hovering only highlights it.
 
 Shortcuts are matched by **physical key position** (virtual key plus scan code), so `` Alt+` `` works on both QWERTY (backtick) and AZERTY (`²`) layouts.
 

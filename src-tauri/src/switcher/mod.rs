@@ -33,6 +33,11 @@ pub(crate) struct ActiveSwitcher {
     pub(crate) targets: Vec<Target>,
     pub(crate) items: Vec<SwitchItem>,
     pub(crate) selected: usize,
+    /// Cards per line as the overlay laid them out: per row in the
+    /// horizontal layout, per column in the vertical one (reported by the
+    /// frontend, see `switcher_grid`), for the arrows that move across lines.
+    /// 0 until the first report: the cards are then treated as one line.
+    pub(crate) per_line: usize,
 }
 
 #[derive(Default)]
@@ -48,6 +53,15 @@ pub(crate) struct HookRuntime {
 pub(crate) static RUNTIME: OnceLock<HookRuntime> = OnceLock::new();
 
 pub(crate) static SWITCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// An arrow key pressed while a switcher is open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
 
 /// Which switcher a session belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

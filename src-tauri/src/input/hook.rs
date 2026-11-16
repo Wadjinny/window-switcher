@@ -319,6 +319,15 @@ fn handle_key_event(key: &KBDLLHOOKSTRUCT, message: u32, at: Instant) -> bool {
                 });
             }
         }
+        Action::Navigate(direction) => {
+            if let Some((generation, _)) = session {
+                post_command(Command::Navigate {
+                    generation,
+                    direction,
+                    at,
+                });
+            }
+        }
         Action::Commit => {
             if let Some((generation, _)) = session {
                 if close_hook_session(generation) {

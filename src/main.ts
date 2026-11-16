@@ -10,7 +10,7 @@ import {
   type SwitchItem,
   type SwitcherPayload,
 } from "./payload";
-import { HoverGate } from "./hover-gate";
+import { cardsPerLine } from "./grid";
 import { previewScale } from "./preview-fit";
 import "./style.css";
 
@@ -422,56 +422,50 @@ function markSelection(view: View, selected: number): void {
 }
 
 /** The overlay window never takes focus (WS_EX_NOACTIVATE), so the mouse can
- * hover and click cards without Windows moving focus away from the app the
- * user was on. Hovering a card selects it — like Windows' own Alt+Tab — and
- * clicking one commits it immediately, even while the modifier is still
- * held. The generation is echoed so a hover or click reported late (by an
+ * click cards without Windows moving focus away from the app the user was
+ * on. Hovering a card only highlights it (CSS); the selection stays with the
+ * keyboard. Clicking a card commits it immediately, even while the modifier
+ * is still held. The generation is echoed so a click reported late (by an
  * overlay that already closed) can never touch a newer session. */
 function attachCardMouse(view: View, card: CardView, index: number): void {
-  card.element.dataset.index = String(index);
   card.element.addEventListener("click", () => {
-    // Clicks always count, moved or not.
     void invoke("switcher_click", { generation: view.generation, index }).catch(
       (error: unknown) => console.warn("Unable to commit from the mouse", error),
     );
   });
 }
 
-/** Hover only selects after the pointer really moved in this opening (see
- * hover-gate.ts), and only when it enters a different card: keyboard cycling
- * keeps working while the mouse rests on a card. */
-const hoverGate = new HoverGate();
-/** The card the pointer is over, or -1; selecting happens on a change. */
-let hoveredIndex = -1;
+let lastGridReport = "";
+let gridFrame = 0;
 
-function resetHover(): void {
-  hoverGate.reset();
-  hoveredIndex = -1;
+/** Tells the backend how many cards fit in one line, so the arrows move
+ * between lines like Windows' own Alt+Tab: per row in the horizontal layout
+ * (for Up/Down), per column in the vertical one, which fills a column top to
+ * bottom and then wraps into the next (for Left/Right). Runs after layout,
+ * so it is scheduled for the next animation frame. */
+function scheduleGridReport(): void {
+  if (gridFrame !== 0) return;
+  gridFrame = requestAnimationFrame(() => {
+    gridFrame = 0;
+    const view = current;
+    if (!view || view.cards.length === 0) return;
+    const vertical = view.layout === "vertical";
+    const perLine = cardsPerLine(
+      view.cards.map((card) =>
+        vertical ? card.element.offsetLeft : card.element.offsetTop,
+      ),
+    );
+    const key = `${view.generation}:${view.layout}:${perLine}`;
+    if (key === lastGridReport) return;
+    lastGridReport = key;
+    invoke("switcher_grid", { generation: view.generation, perLine }).catch(
+      (error: unknown) => {
+        lastGridReport = "";
+        console.warn("Unable to report the switcher grid", error);
+      },
+    );
+  });
 }
-
-function cardIndexAt(target: EventTarget | null): number {
-  if (!(target instanceof Element)) return -1;
-  const element = target.closest<HTMLElement>(".item");
-  const index = element ? Number(element.dataset.index) : -1;
-  return Number.isInteger(index) ? index : -1;
-}
-
-document.addEventListener("pointermove", (event) => {
-  const view = current;
-  if (!hoverGate.move(event.screenX, event.screenY) || !view) return;
-  const index = cardIndexAt(event.target);
-  if (index === hoveredIndex) return;
-  hoveredIndex = index;
-  const card = view.cards[index];
-  if (!card || card.element.classList.contains("selected")) return;
-  void invoke("switcher_select", { generation: view.generation, index }).catch(
-    (error: unknown) => console.warn("Unable to select from the mouse", error),
-  );
-});
-
-document.documentElement.addEventListener("pointerleave", () => {
-  hoveredIndex = -1;
-});
 
 // ---------------------------------------------------------------------------
 // Window previews
@@ -538,6 +532,7 @@ window.addEventListener("resize", () => {
   // between monitors changes the device pixel ratio.
   lastThumbnailReport = "";
   scheduleThumbnailReport();
+  scheduleGridReport();
 });
 
 let renderedGeneration: number | null = null;
@@ -547,10 +542,10 @@ function render(payload: SwitcherPayload): void {
   renderPayload(payload);
   if (payload.generation !== renderedGeneration) {
     renderedGeneration = payload.generation;
-    resetHover();
     markOpening();
   }
   if (payload.card_style === "preview") scheduleThumbnailReport();
+  scheduleGridReport();
 }
 
 /** A new opening: paint the selection without its transition, then allow it
