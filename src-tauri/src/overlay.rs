@@ -381,6 +381,17 @@ fn overlay_rect(label: &str) -> Option<RECT> {
     Some(rect)
 }
 
+/// Whether `hwnd` is one of the overlays, for the mouse hook. Never waits:
+/// `None` when the registry is busy right now (an overlay is being created
+/// or destroyed), and the caller then plays it safe.
+pub(crate) fn is_overlay_window(hwnd: HWND) -> Option<bool> {
+    let Some(hwnds) = OVERLAY_HWNDS.get() else {
+        return Some(false);
+    };
+    let hwnds = hwnds.try_lock().ok()?;
+    Some(hwnds.values().any(|&raw| raw == hwnd.0 as isize))
+}
+
 /// Creates `switcher-1` .. `switcher-{count-1}` from the overlay's config.
 /// Runs on its own thread: building a webview waits on the main thread, which
 /// the keyboard hook must never do.

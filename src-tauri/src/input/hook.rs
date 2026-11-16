@@ -29,7 +29,9 @@ use super::{
     alt_key_down,
     decide::{decide_key, Action, Foreground, KeyInput},
     inject::{send_mask_key, MASK_KEY_TAG},
-    key_is_down, win_key_down,
+    key_is_down,
+    mouse::{install_mouse_hook, remove_mouse_hook, remove_mouse_hook_if_idle},
+    win_key_down,
 };
 use crate::{
     hotkey::{app_shortcut, window_shortcut},
@@ -50,7 +52,7 @@ static HOOK_HANDLE: AtomicUsize = AtomicUsize::new(0);
 /// clears it, and only for the generation it is closing.
 pub(crate) static HOOK_SESSION: AtomicU64 = AtomicU64::new(0);
 
-fn hook_session() -> Option<(u64, SwitchMode)> {
+pub(super) fn hook_session() -> Option<(u64, SwitchMode)> {
     let packed = HOOK_SESSION.load(Ordering::SeqCst);
     let mode = match packed & 3 {
         1 => SwitchMode::Window,
@@ -84,8 +86,21 @@ pub(crate) static APP_TARGETS_HINT: AtomicUsize = AtomicUsize::new(2);
 /// Posted by the hook procedure to its own thread: send the mask key right
 /// after the hook returns (see `queue_mask_key`).
 const WM_HOOK_SEND_MASK: u32 = WM_APP + 2;
-/// The hook thread's id, for `WM_HOOK_SEND_MASK`.
+/// Posted to the hook thread when a switcher opens: (re)install the mouse
+/// hook that closes it on a click outside (see `mouse.rs`).
+const WM_HOOK_MOUSE_ON: u32 = WM_APP + 3;
+/// Posted by the mouse hook once the switcher closed: remove it.
+pub(super) const WM_HOOK_MOUSE_OFF: u32 = WM_APP + 4;
+/// The hook thread's id, for the `WM_HOOK_*` messages.
 static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Posts a `WM_HOOK_*` message to the hook thread. Returns false when it
+/// could not be posted.
+pub(super) fn post_to_hook_thread(message: u32) -> bool {
+    let thread_id = HOOK_THREAD_ID.load(Ordering::SeqCst);
+    thread_id != 0
+        && unsafe { PostThreadMessageW(thread_id, message, WPARAM(0), LPARAM(0)) }.is_ok()
+}
 
 /// How often the hook thread considers reinstalling the hook, and how long
 /// a hook lives before it is reinstalled at the next quiet moment.
@@ -131,9 +146,22 @@ pub(crate) fn install_keyboard_hook() {
             let rehook_timer = SetTimer(None, 0, REHOOK_CHECK_MS, None);
             let mut message = MSG::default();
             while GetMessageW(&mut message, None, 0, 0).as_bool() {
-                if message.hwnd.0.is_null() && message.message == WM_HOOK_SEND_MASK {
-                    send_mask_key();
-                    continue;
+                if message.hwnd.0.is_null() {
+                    match message.message {
+                        WM_HOOK_SEND_MASK => {
+                            send_mask_key();
+                            continue;
+                        }
+                        WM_HOOK_MOUSE_ON => {
+                            install_mouse_hook();
+                            continue;
+                        }
+                        WM_HOOK_MOUSE_OFF => {
+                            remove_mouse_hook_if_idle();
+                            continue;
+                        }
+                        _ => {}
+                    }
                 }
                 if message.hwnd.0.is_null()
                     && message.message == WM_TIMER
@@ -149,6 +177,7 @@ pub(crate) fn install_keyboard_hook() {
                 DispatchMessageW(&message);
             }
             remove_keyboard_hook();
+            remove_mouse_hook();
         });
 
     if let Err(error) = spawned {
@@ -198,6 +227,7 @@ fn reinstall_keyboard_hook() {
 
 pub(crate) fn remove_keyboard_hook() {
     HOOK_EXITING.store(true, Ordering::SeqCst);
+    remove_mouse_hook();
     let raw = HOOK_HANDLE.swap(0, Ordering::SeqCst);
     if raw != 0 {
         unsafe {
@@ -309,6 +339,8 @@ fn handle_key_event(key: &KBDLLHOOKSTRUCT, message: u32, at: Instant) -> bool {
                 scan_code: key.scanCode,
                 at,
             });
+            // Watch for a click outside the switcher while it is open.
+            post_to_hook_thread(WM_HOOK_MOUSE_ON);
         }
         Action::Advance { reverse } => {
             if let Some((generation, _)) = session {
@@ -373,11 +405,7 @@ fn handle_key_event(key: &KBDLLHOOKSTRUCT, message: u32, at: Instant) -> bool {
 /// input is appended to the input queue either way, so the order of events
 /// is the same as sending it inline.
 fn queue_mask_key() {
-    let thread_id = HOOK_THREAD_ID.load(Ordering::SeqCst);
-    let posted = thread_id != 0
-        && unsafe { PostThreadMessageW(thread_id, WM_HOOK_SEND_MASK, WPARAM(0), LPARAM(0)) }
-            .is_ok();
-    if !posted {
+    if !post_to_hook_thread(WM_HOOK_SEND_MASK) {
         send_mask_key();
     }
 }

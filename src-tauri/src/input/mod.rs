@@ -1,9 +1,10 @@
-//! Keyboard input: the low-level hook, its pure decision, and the keys we
-//! inject.
+//! Keyboard and mouse input: the low-level hooks, their pure decisions, and
+//! the keys we inject.
 
 pub(crate) mod decide;
 pub(crate) mod hook;
 pub(crate) mod inject;
+pub(crate) mod mouse;
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_LMENU, VK_LWIN, VK_RMENU, VK_RWIN,
