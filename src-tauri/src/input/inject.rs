@@ -2,7 +2,7 @@
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-    VIRTUAL_KEY, VK_LMENU, VK_LWIN,
+    VIRTUAL_KEY, VK_ESCAPE, VK_LMENU, VK_LWIN,
 };
 
 use super::{alt_key_down, win_key_down};
@@ -52,6 +52,15 @@ pub(crate) fn send_mask_key() {
     ];
     if !send_tagged(&inputs) {
         log::warn!("unable to send the mask key");
+    }
+}
+
+/// Presses Escape (tagged, so our hook lets it through): closes Task View
+/// or a shell flyout that refuses to give up the foreground.
+pub(crate) fn send_escape() {
+    let vk = VK_ESCAPE.0;
+    if !send_tagged(&[tagged_key(vk, 0, false), tagged_key(vk, 0, true)]) {
+        log::warn!("unable to send Escape");
     }
 }
 

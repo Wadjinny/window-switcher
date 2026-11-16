@@ -5,6 +5,7 @@ pub(crate) mod activate;
 pub(crate) mod enumerate;
 pub(crate) mod grouping;
 pub(crate) mod identity;
+pub(crate) mod shell;
 
 use std::path::PathBuf;
 

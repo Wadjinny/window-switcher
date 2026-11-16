@@ -19,18 +19,19 @@ use windows::{
     },
 };
 
-use super::{identity::app_user_model_id, Target};
+use super::{identity::app_user_model_id, shell::shell_surface, Target};
 
 /// The window the switcher works relative to: the foreground window, or,
-/// when one of ours (Settings) is in front, the topmost other app's window,
-/// i.e. the one the user came from (our windows are never switch targets).
-/// The flag says that window is not focused, so its card is a real move.
+/// when one of ours (Settings) or a shell surface (Task View, Start, the
+/// desktop, the taskbar) is in front, the topmost app window, i.e. the one
+/// the user came from (neither is ever a switch target). The flag says that
+/// window is not focused, so its card is a real move.
 pub(crate) fn switch_origin() -> Option<(HWND, bool)> {
     let foreground = unsafe { GetForegroundWindow() };
     if foreground.0.is_null() {
         return None;
     }
-    if !is_own_window(foreground) {
+    if !is_own_window(foreground) && shell_surface(foreground).is_none() {
         return Some((foreground, false));
     }
     eligible_windows()
