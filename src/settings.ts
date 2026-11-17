@@ -7,8 +7,10 @@ import "./settings.css";
 //
 // To add a choice setting: add its allowed values to CHOICES, add the radio
 // fieldset (inputs named after the key) to settings.html, and add a match arm
-// to `set_setting` in main.rs. Other kinds of controls register a `render`
-// function in RENDERERS so they refresh whenever settings are loaded or saved.
+// to `set_setting` in ipc.rs. On/off settings are checkboxes named after a
+// key in TOGGLE_KEYS; they are sent as "true"/"false" and come back as
+// booleans. Other kinds of controls register a `render` function in
+// RENDERERS so they refresh whenever settings are loaded or saved.
 
 const CHOICES = {
   show_switcher_on: ["primary", "every", "cursor"],
@@ -18,10 +20,18 @@ const CHOICES = {
 
 const HOTKEY_KEYS = ["app_hotkey", "window_hotkey"] as const;
 
+const TOGGLE_KEYS = ["settings_in_switcher", "start_with_windows", "run_as_admin"] as const;
+
 type ChoiceKey = keyof typeof CHOICES;
 type HotkeyKey = (typeof HOTKEY_KEYS)[number];
-type SettingKey = ChoiceKey | HotkeyKey;
-type Settings = Partial<Record<SettingKey, string>>;
+type ToggleKey = (typeof TOGGLE_KEYS)[number];
+type Settings = Partial<
+  Record<ChoiceKey | HotkeyKey, string> &
+    Record<ToggleKey, boolean> & {
+      /** Read-only: whether the app is elevated right now. */
+      running_as_admin: boolean;
+    }
+>;
 
 const CHOICE_KEYS = Object.keys(CHOICES) as ChoiceKey[];
 const DEFAULT_STATUS = "Changes apply and save immediately.";
@@ -37,6 +47,10 @@ function isChoiceKey(value: string): value is ChoiceKey {
 
 function isHotkeyKey(value: string | undefined): value is HotkeyKey {
   return (HOTKEY_KEYS as readonly (string | undefined)[]).includes(value);
+}
+
+function isToggleKey(value: string): value is ToggleKey {
+  return (TOGGLE_KEYS as readonly string[]).includes(value);
 }
 
 function isChoice<K extends ChoiceKey>(
@@ -57,6 +71,13 @@ function parseSettings(value: unknown): Settings {
   for (const key of HOTKEY_KEYS) {
     const hotkey = record[key];
     if (typeof hotkey === "string" && parseHotkey(hotkey)) settings[key] = hotkey;
+  }
+  for (const key of TOGGLE_KEYS) {
+    const enabled = record[key];
+    if (typeof enabled === "boolean") settings[key] = enabled;
+  }
+  if (typeof record.running_as_admin === "boolean") {
+    settings.running_as_admin = record.running_as_admin;
   }
   return settings;
 }
@@ -87,6 +108,50 @@ for (const radio of radios) {
       void save(() => invoke<unknown>("set_setting", { key, value: radio.value }));
     }
   });
+}
+
+// ---------------------------------------------------------------------------
+// On/off settings (checkboxes)
+// ---------------------------------------------------------------------------
+
+const checkboxes = Array.from(
+  document.querySelectorAll<HTMLInputElement>("input[type=checkbox]"),
+);
+
+function renderToggles(settings: Settings): void {
+  for (const checkbox of checkboxes) {
+    if (!isToggleKey(checkbox.name)) continue;
+    const value = settings[checkbox.name];
+    if (value !== undefined) checkbox.checked = value;
+  }
+}
+
+for (const checkbox of checkboxes) {
+  checkbox.addEventListener("change", () => {
+    const key = checkbox.name;
+    if (isToggleKey(key)) {
+      const value = String(checkbox.checked);
+      if (key === "run_as_admin" && checkbox.checked && current.running_as_admin === false) {
+        // On success the app restarts elevated and this window closes; the
+        // reply never comes.
+        setStatus("Restarting as administrator: confirm the Windows prompt.");
+      }
+      void save(() => invoke<unknown>("set_setting", { key, value }));
+    }
+  });
+}
+
+const adminStatus = document.getElementById("admin-status");
+
+function renderAdminStatus(settings: Settings): void {
+  if (!adminStatus || settings.running_as_admin === undefined) return;
+  if (!settings.running_as_admin) {
+    adminStatus.textContent = "Currently running without administrator rights.";
+  } else if (settings.run_as_admin === false) {
+    adminStatus.textContent = "Currently running as administrator, until Window Switcher restarts.";
+  } else {
+    adminStatus.textContent = "Currently running as administrator.";
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -277,7 +342,12 @@ void listen<unknown>("settings:hotkey-recorded", ({ payload }) => {
 // Load and save
 // ---------------------------------------------------------------------------
 
-const RENDERERS: ((settings: Settings) => void)[] = [renderChoices, renderHotkeys];
+const RENDERERS: ((settings: Settings) => void)[] = [
+  renderChoices,
+  renderToggles,
+  renderAdminStatus,
+  renderHotkeys,
+];
 
 function render(settings: Settings): void {
   current = { ...current, ...settings };

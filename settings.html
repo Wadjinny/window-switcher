@@ -104,6 +104,32 @@
           </label>
         </div>
       </fieldset>
+      <fieldset class="group">
+        <legend>General</legend>
+        <div class="card">
+          <label class="option">
+            <input type="checkbox" name="settings_in_switcher" />
+            <span class="option-text">
+              <span class="option-title">Include this Settings window in the switcher</span>
+              <span class="option-detail">Switch to and from it like any other window while it is open.</span>
+            </span>
+          </label>
+          <label class="option">
+            <input type="checkbox" name="start_with_windows" />
+            <span class="option-text">
+              <span class="option-title">Start with Windows</span>
+              <span class="option-detail">Open Window Switcher when you sign in.</span>
+            </span>
+          </label>
+          <label class="option">
+            <input type="checkbox" name="run_as_admin" />
+            <span class="option-text">
+              <span class="option-title">Run as administrator</span>
+              <span class="option-detail">Lets the switcher see and switch to apps that run as administrator. Windows asks for permission when it starts, except at sign-in. <span id="admin-status"></span></span>
+            </span>
+          </label>
+        </div>
+      </fieldset>
       <p class="note" id="status" role="status">Changes apply and save immediately.</p>
     </main>
     <script type="module" src="/src/settings.ts"></script>

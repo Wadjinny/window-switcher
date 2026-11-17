@@ -26,6 +26,12 @@ pub(crate) struct AppConfig {
     pub(crate) card_style: String,
     /// "horizontal" or "vertical"; anything else falls back to "horizontal".
     pub(crate) layout: String,
+    /// Offer the Settings window as a switch target, and switch from it like
+    /// from any other window, instead of skipping it.
+    pub(crate) settings_in_switcher: bool,
+    /// Restart elevated (through the UAC prompt) when started without
+    /// administrator rights; see `elevation.rs`.
+    pub(crate) run_as_admin: bool,
 }
 
 impl Default for AppConfig {
@@ -38,6 +44,8 @@ impl Default for AppConfig {
             show_switcher_on: MonitorMode::Primary.as_str().into(),
             card_style: CardStyle::Icon.as_str().into(),
             layout: Layout::Horizontal.as_str().into(),
+            settings_in_switcher: false,
+            run_as_admin: false,
         }
     }
 }
@@ -64,7 +72,10 @@ pub(crate) fn lock_config() -> ConfigLock {
 /// Saves `values`, then makes them live with `apply`, under the config lock:
 /// a failed save changes nothing, and two quick changes can never leave
 /// memory and the file holding different values.
-pub(crate) fn persist(values: &[(&str, String)], apply: impl FnOnce()) -> Result<(), String> {
+pub(crate) fn persist(
+    values: &[(&str, serde_json::Value)],
+    apply: impl FnOnce(),
+) -> Result<(), String> {
     let lock = lock_config();
     save_config_values(&lock, values)?;
     apply();
@@ -181,7 +192,7 @@ fn load_config_in(lock: &ConfigLock, directory: &Path) -> AppConfig {
 /// the save fails, rather than replacing the user's text with defaults.
 pub(crate) fn save_config_values(
     lock: &ConfigLock,
-    values: &[(&str, String)],
+    values: &[(&str, serde_json::Value)],
 ) -> Result<(), String> {
     save_config_values_in(lock, &app_data_path(), values)
 }
@@ -189,7 +200,7 @@ pub(crate) fn save_config_values(
 fn save_config_values_in(
     lock: &ConfigLock,
     directory: &Path,
-    values: &[(&str, String)],
+    values: &[(&str, serde_json::Value)],
 ) -> Result<(), String> {
     let file = config_file(directory);
     let mut root = match fs::read_to_string(&file) {
@@ -209,7 +220,7 @@ fn save_config_values_in(
     };
     if let Some(object) = root.as_object_mut() {
         for (key, value) in values {
-            object.insert(key.to_string(), serde_json::Value::String(value.clone()));
+            object.insert(key.to_string(), value.clone());
         }
     }
     write_config_file(lock, directory, &root)
@@ -225,6 +236,8 @@ mod tests {
   "app_hotkey": "Win+Tab",
   "card_style": "icon",
   "layout": "horizontal",
+  "run_as_admin": false,
+  "settings_in_switcher": false,
   "show_switcher_on": "primary",
   "window_hotkey": "Alt+Backtick"
 }"#;

@@ -19,6 +19,7 @@ use crate::{
     hotkey::config_key_name,
     ipc::RecordedHotkey,
     overlay::{cursor_monitor_area, primary_monitor_area},
+    settings_model::SETTINGS_IN_SWITCHER,
     switcher::{controller::RecordedKey, HookRuntime},
     targets::activate::activate_window,
 };
@@ -116,6 +117,19 @@ pub(crate) static RECORDING_HOTKEY: AtomicBool = AtomicBool::new(false);
 /// HWND of the Settings window (0 when closed). Recording only captures keys
 /// while that window is in the foreground.
 static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// Whether `hwnd` is the Settings window and `settings_in_switcher` is on, so
+/// the switcher treats it like any other app window.
+pub(crate) fn settings_is_switchable(hwnd: HWND) -> bool {
+    let settings = SETTINGS_HWND.load(Ordering::SeqCst);
+    SETTINGS_IN_SWITCHER.load(Ordering::SeqCst) && settings != 0 && hwnd.0 as isize == settings
+}
+
+/// The Settings window, while it exists.
+pub(crate) fn settings_hwnd() -> Option<HWND> {
+    let settings = SETTINGS_HWND.load(Ordering::SeqCst);
+    (settings != 0).then_some(HWND(settings as *mut _))
+}
 
 pub(crate) fn settings_is_foreground() -> bool {
     let settings = SETTINGS_HWND.load(Ordering::SeqCst);

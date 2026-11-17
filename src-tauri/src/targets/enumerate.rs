@@ -20,9 +20,11 @@ use windows::{
 };
 
 use super::{identity::app_user_model_id, shell::shell_surface, Target};
+use crate::settings_window::settings_is_switchable;
 
 /// The window the switcher works relative to: the foreground window, or,
-/// when one of ours (Settings) or a shell surface (Task View, Start, the
+/// when one of ours (Settings, unless `settings_in_switcher` is on; see
+/// `is_internal_window`) or a shell surface (Task View, Start, the
 /// desktop, the taskbar) is in front, the topmost app window, i.e. the one
 /// the user came from (neither is ever a switch target). The flag says that
 /// window is not focused, so its card is a real move.
@@ -31,7 +33,7 @@ pub(crate) fn switch_origin() -> Option<(HWND, bool)> {
     if foreground.0.is_null() {
         return None;
     }
-    if !is_own_window(foreground) && shell_surface(foreground).is_none() {
+    if !is_internal_window(foreground) && shell_surface(foreground).is_none() {
         return Some((foreground, false));
     }
     eligible_windows()
@@ -97,7 +99,8 @@ trait WindowFacts {
     fn has_title(&self) -> bool;
 }
 
-/// The windows Alt+Tab would show: visible, not ours, not a child or tool
+/// The windows Alt+Tab would show: visible, not ours (`own` already allows
+/// for the Settings option), not a child or tool
 /// window, unowned (or explicitly an app window), not cloaked, and titled.
 fn passes_switch_filter(window: &impl WindowFacts) -> bool {
     // Our own overlay must never be offered as a target.
@@ -127,7 +130,7 @@ impl WindowFacts for LiveWindow {
     }
 
     fn own(&self) -> bool {
-        is_own_window(self.0)
+        is_internal_window(self.0)
     }
 
     fn style(&self) -> u32 {
@@ -167,7 +170,20 @@ fn is_switchable(hwnd: HWND) -> bool {
     passes_switch_filter(&LiveWindow(hwnd))
 }
 
-pub(crate) fn is_own_window(hwnd: HWND) -> bool {
+/// One of ours that the switcher never lists or switches relative to: the
+/// overlays always, and the Settings window unless `settings_in_switcher` is
+/// on, in which case it is an ordinary window.
+pub(crate) fn is_internal_window(hwnd: HWND) -> bool {
+    internal(is_own_window(hwnd), || settings_is_switchable(hwnd))
+}
+
+/// `is_internal_window` without Win32, so it is unit tested. The Settings
+/// check is only made for our own windows.
+fn internal(own: bool, listed_settings: impl FnOnce() -> bool) -> bool {
+    own && !listed_settings()
+}
+
+fn is_own_window(hwnd: HWND) -> bool {
     unsafe {
         let mut pid = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
@@ -310,5 +326,18 @@ mod tests {
             ex_style: WS_EX_APPWINDOW.0,
             ..APP
         }));
+    }
+
+    #[test]
+    fn our_windows_are_internal_unless_they_are_the_listed_settings_window() {
+        // Another app's window: never internal, and the Settings check is
+        // not even made.
+        assert!(!internal(false, || panic!(
+            "only asked for our own windows"
+        )));
+        // The overlay, or Settings with the option off.
+        assert!(internal(true, || false));
+        // Settings with `settings_in_switcher` on: an ordinary window.
+        assert!(!internal(true, || true));
     }
 }

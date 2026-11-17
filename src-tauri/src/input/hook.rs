@@ -41,7 +41,7 @@ use crate::{
         controller::{post_command, Command, RecordedKey},
         SwitchMode, SWITCHER_GENERATION,
     },
-    targets::enumerate::is_own_window,
+    targets::enumerate::is_internal_window,
     timing,
 };
 
@@ -303,7 +303,7 @@ fn handle_key_event(key: &KBDLLHOOKSTRUCT, message: u32, at: Instant) -> bool {
         recording: RECORDING_HOTKEY.load(Ordering::SeqCst) && settings_is_foreground(),
         foreground: if foreground.0.is_null() {
             Foreground::None
-        } else if is_own_window(foreground) {
+        } else if is_internal_window(foreground) {
             Foreground::Own
         } else {
             Foreground::Other

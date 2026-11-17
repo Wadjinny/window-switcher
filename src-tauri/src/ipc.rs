@@ -8,16 +8,19 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, WebviewWindow};
 
 use crate::{
-    config::persist,
+    config::{lock_config, persist, save_config_values},
+    elevation::{is_elevated, relaunch_elevated},
     hotkey::{
         app_shortcut, store_shortcuts, window_shortcut, DEFAULT_APP_SHORTCUT,
         DEFAULT_WINDOW_SHORTCUT,
     },
     settings_model::{
-        apply_card_style, apply_hotkey, apply_layout, apply_monitor_mode, current_card_style,
-        current_layout, current_monitor_mode,
+        apply_card_style, apply_hotkey, apply_layout, apply_monitor_mode,
+        apply_settings_in_switcher, current_card_style, current_layout, current_monitor_mode,
+        parse_toggle, RUN_AS_ADMIN, SETTINGS_IN_SWITCHER,
     },
-    settings_window::{settings_is_foreground, RECORDING_HOTKEY},
+    settings_window::{settings_hwnd, settings_is_foreground, RECORDING_HOTKEY},
+    startup,
     switcher::{
         controller::{post_command, Command},
         session::payload_snapshot,
@@ -136,6 +139,13 @@ pub(crate) struct SettingsPayload {
     layout: String,
     app_hotkey: String,
     window_hotkey: String,
+    settings_in_switcher: bool,
+    /// Read from the registry and Task Scheduler each time, not
+    /// `config.json` (see `startup.rs`).
+    start_with_windows: bool,
+    run_as_admin: bool,
+    /// Whether this process is elevated (read-only).
+    running_as_admin: bool,
 }
 
 #[tauri::command]
@@ -146,6 +156,10 @@ pub(crate) fn get_settings() -> SettingsPayload {
         layout: current_layout().as_str().to_string(),
         app_hotkey: app_shortcut().config_value(),
         window_hotkey: window_shortcut().config_value(),
+        settings_in_switcher: SETTINGS_IN_SWITCHER.load(Ordering::SeqCst),
+        start_with_windows: startup::is_enabled(),
+        run_as_admin: RUN_AS_ADMIN.load(Ordering::SeqCst),
+        running_as_admin: is_elevated(),
     }
 }
 
@@ -168,9 +182,63 @@ pub(crate) async fn set_setting(
         "card_style" => apply_card_style(&value)?,
         "layout" => apply_layout(&value)?,
         "app_hotkey" | "window_hotkey" => apply_hotkey(&app, &key, &value)?,
+        "settings_in_switcher" => apply_settings_in_switcher(&value)?,
+        "start_with_windows" => apply_start_with_windows(&value)?,
+        "run_as_admin" => apply_run_as_admin(&app, &value)?,
         _ => return Err(format!("unknown setting {key:?}")),
     }
     Ok(get_settings())
+}
+
+/// Adds or removes the sign-in startup entry. It lives in the registry or
+/// Task Scheduler rather than `config.json`; the config lock still keeps two
+/// quick toggles in order, and keeps "Run as administrator" from changing
+/// meanwhile.
+fn apply_start_with_windows(value: &str) -> Result<(), String> {
+    let enabled = parse_toggle("start_with_windows", value)?;
+    let _lock = lock_config();
+    startup::set_enabled(enabled, RUN_AS_ADMIN.load(Ordering::SeqCst))?;
+    log::info!("start with Windows: {enabled}");
+    Ok(())
+}
+
+/// Saves "Run as administrator". Turned on without administrator rights, it
+/// restarts the app elevated through the UAC prompt and this instance exits
+/// (the reply never arrives; the new instance reopens Settings). If the
+/// prompt is declined, the setting is turned back off and the error says so:
+/// leaving it on would show a UAC prompt at every launch the user just
+/// refused, while the checkbox claimed something that is not in effect.
+///
+/// Turned off while elevated, the app stays elevated until it restarts.
+/// Either way, an existing startup entry moves to the matching mechanism
+/// when this process is allowed to (see `startup::reconcile`).
+fn apply_run_as_admin(app: &AppHandle, value: &str) -> Result<(), String> {
+    let enabled = parse_toggle("run_as_admin", value)?;
+    let lock = lock_config();
+    save_config_values(&lock, &[("run_as_admin", enabled.into())])?;
+    RUN_AS_ADMIN.store(enabled, Ordering::SeqCst);
+    log::info!("run as administrator: {enabled}");
+
+    if enabled && !is_elevated() {
+        match relaunch_elevated(settings_hwnd(), true) {
+            Ok(()) => {
+                app.exit(0);
+                return Ok(());
+            }
+            Err(error) => {
+                if let Err(revert) = save_config_values(&lock, &[("run_as_admin", false.into())]) {
+                    log::error!("unable to turn run_as_admin back off: {revert}");
+                }
+                RUN_AS_ADMIN.store(false, Ordering::SeqCst);
+                return Err(error.message());
+            }
+        }
+    }
+    if let Err(error) = startup::reconcile(enabled) {
+        // Retried at every launch; the next one with the rights fixes it.
+        log::warn!("unable to update the startup entry: {error}");
+    }
+    Ok(())
 }
 
 /// Restores both hotkeys to their defaults in one write.
@@ -178,8 +246,11 @@ pub(crate) async fn set_setting(
 pub(crate) fn reset_hotkeys(app: AppHandle) -> Result<SettingsPayload, String> {
     persist(
         &[
-            ("window_hotkey", DEFAULT_WINDOW_SHORTCUT.config_value()),
-            ("app_hotkey", DEFAULT_APP_SHORTCUT.config_value()),
+            (
+                "window_hotkey",
+                DEFAULT_WINDOW_SHORTCUT.config_value().into(),
+            ),
+            ("app_hotkey", DEFAULT_APP_SHORTCUT.config_value().into()),
         ],
         || store_shortcuts(DEFAULT_WINDOW_SHORTCUT, DEFAULT_APP_SHORTCUT),
     )?;

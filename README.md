@@ -77,7 +77,7 @@ To keep a stable copy that does not change when you rebuild:
 npm run install:local
 ```
 
-That stops any running `Window Switcher` process, copies the release exe to `%LOCALAPPDATA%\Programs\Window Switcher\Window Switcher.exe`, and prints the resulting path. It does not create shortcuts or startup entries.
+That stops any running `Window Switcher` process, copies the release exe to `%LOCALAPPDATA%\Programs\Window Switcher\Window Switcher.exe`, and prints the resulting path. It does not create shortcuts or startup entries; turn on **Start with Windows** in Settings from the installed copy for that (see [Start with Windows](#start-with-windows)).
 
 Notes:
 
@@ -126,6 +126,34 @@ Both values accept a modifier and a key joined by `+`. Matching is case-insensit
 The easiest way to change them is the tray menu's **Settings…** window: click a shortcut, then hold Alt or Win and press Tab or the backtick key (Esc cancels). It rejects combinations the hook cannot use (Ctrl, Shift, other keys, the same shortcut twice), applies the new hotkeys immediately and writes them here. **Reset to defaults** restores the values above.
 
 If you edit the file by hand instead, restart the application - the file is read once at startup.
+
+### The Settings window in the switcher
+
+By default the switcher leaves the Settings window out: the shortcuts still work while it is in front, but they act on the app you came from, and Settings never gets a card, so you cannot switch back to it. Tick **Include this Settings window in the switcher** (stored as `"settings_in_switcher": true`) to treat it like any other window: it gets its own card, and switching from it starts at the previous app. While a shortcut field is recording, key presses in Settings still go to the recorder instead of opening the switcher, whatever this option says.
+
+## Start with Windows
+
+The Settings window's **Start with Windows** checkbox adds a per-user entry named `Window Switcher` under
+
+`HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`
+
+pointing at the quoted path of the exe that is running, so it starts when you sign in. No admin rights are needed. Unticking it removes the entry. The setting is not stored in `config.json`: the checkbox always shows what Windows will do, and it shows as off if you disable the entry in Task Manager's **Startup apps** page (ticking it again re-enables it).
+
+With **Run as administrator** also on, a `Run` entry is not enough: Windows starts those without administrator rights. Window Switcher then uses a scheduled task instead, also named `Window Switcher` (in the root of Task Scheduler), that starts the exe at your sign-in with **Run with highest privileges**, so it starts elevated without a UAC prompt. It removes the `Run` value when it creates the task, and the other way round when you turn **Run as administrator** off; only one of the two exists at a time. Creating or removing that task needs administrator rights, so the switch happens in the elevated copy: until then the `Run` value stays, and at sign-in it starts the app normally, which then asks for elevation and swaps the `Run` value for the task. Disabling the task in Task Scheduler shows **Start with Windows** as off.
+
+Because the entry points at the running exe, turn it on from the copy you keep (for example the one `npm run install:local` installs), not from a build under `target\`. If you move the exe, untick and tick the box again to update the path.
+
+## Run as administrator
+
+Windows does not let a program without administrator rights look into, activate or send keys to the windows of programs that run as administrator (Task Manager, an elevated terminal, installers...), and the switcher's keyboard hook gets no keys while one of them is in front. Tick **Run as administrator** in Settings (stored in `config.json` as `"run_as_admin": true`) to run Window Switcher elevated so those windows work like any other.
+
+- Ticking it while running normally restarts Window Switcher through the UAC prompt; the new copy reopens Settings. If you decline the prompt, it keeps running as before and the box turns back off.
+- With it on, every launch without administrator rights asks for them once (UAC prompt). Declining keeps that session running without them; the setting stays on for next time. A launch at sign-in through **Start with Windows** needs no prompt (see above).
+- Unticking it takes effect at the next start; until then the app stays elevated. Settings shows whether the running copy is elevated.
+
+This is meant for accounts that are administrators. On a standard account, the UAC prompt asks for an administrator's password and the elevated copy would run as that other account, with its own settings.
+
+While Window Switcher runs elevated, `npm run install:local` cannot stop it from a normal terminal; quit it from the tray first (or run the script from an elevated terminal).
 
 ## License
 

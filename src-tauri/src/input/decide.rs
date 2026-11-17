@@ -15,7 +15,8 @@ use crate::{
 pub(crate) enum Foreground {
     /// No foreground window (e.g. during a desktop switch).
     None,
-    /// One of ours (Settings): the switcher works relative to the last app.
+    /// One of ours (Settings, unless `settings_in_switcher` lists it): the
+    /// switcher works relative to the last app.
     Own,
     Other,
 }

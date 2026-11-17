@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+mod elevation;
 mod hotkey;
 mod icons;
 mod input;
@@ -8,6 +9,7 @@ mod ipc;
 mod overlay;
 mod settings_model;
 mod settings_window;
+mod startup;
 mod switcher;
 mod targets;
 mod thumbnails;
@@ -27,13 +29,16 @@ use windows::{
 
 use crate::{
     config::load_config,
+    elevation::{is_elevated, relaunch_elevated, wait_for_replaced_instance, LaunchArgs},
     hotkey::{startup_shortcuts, store_shortcuts},
     icons::warm_item_caches,
     input::hook::{install_keyboard_hook, remove_keyboard_hook},
     overlay::{all_monitor_areas, prepare_overlay_window, spawn_overlay_windows, OVERLAY_LABEL},
     settings_model::{
-        CardStyle, Layout, MonitorMode, MONITOR_MODE, PREVIEW_CARDS, VERTICAL_LAYOUT,
+        CardStyle, Layout, MonitorMode, MONITOR_MODE, PREVIEW_CARDS, RUN_AS_ADMIN,
+        SETTINGS_IN_SWITCHER, VERTICAL_LAYOUT,
     },
+    settings_window::open_settings,
     switcher::{controller::start_controller, HookRuntime, SwitcherState, RUNTIME},
     tray::install_tray,
 };
@@ -61,6 +66,12 @@ fn main() {
         ))
         .build();
 
+    // An elevated copy started by "Run as administrator" waits here for the
+    // instance it replaces to exit, or the single-instance guard below
+    // would hand over to that instance and quit.
+    let launch = LaunchArgs::parse(env::args_os().skip(1));
+    wait_for_replaced_instance(&launch);
+
     let built = tauri::Builder::default()
         // The single-instance guard must come first: a second launch has to
         // exit before setup installs a second hook and tray icon.
@@ -79,7 +90,7 @@ fn main() {
             ipc::update_thumbnails,
             ipc::overlay_timing
         ])
-        .setup(|app| setup_app(app))
+        .setup(move |app| setup_app(app, launch))
         .build(tauri::generate_context!());
 
     let app = match built {
@@ -95,10 +106,36 @@ fn main() {
     });
 }
 
-fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    log::info!("Window Switcher {} starting", env!("CARGO_PKG_VERSION"));
+fn setup_app(app: &mut tauri::App, launch: LaunchArgs) -> Result<(), Box<dyn std::error::Error>> {
+    log::info!(
+        "Window Switcher {} starting{}",
+        env!("CARGO_PKG_VERSION"),
+        if is_elevated() {
+            " as administrator"
+        } else {
+            ""
+        }
+    );
 
     let config = load_config();
+    RUN_AS_ADMIN.store(config.run_as_admin, Ordering::SeqCst);
+    if config.run_as_admin && !is_elevated() {
+        if launch.replaces.is_some() {
+            // Asked for elevation and still not elevated (e.g. UAC is turned
+            // off for a standard account): asking again would loop.
+            log::warn!("restarted for administrator rights but did not get them");
+        } else if relaunch_elevated(None, launch.open_settings).is_ok() {
+            // Nothing is installed yet (hook, tray), so there is nothing to
+            // clean up; exiting releases the single-instance guard.
+            std::process::exit(0);
+        }
+    }
+    log::info!("run as administrator: {}", config.run_as_admin);
+    // Move the startup entry to the mechanism that fits (e.g. the Run value
+    // to the elevated scheduled task now that this process may create it).
+    if let Err(error) = startup::reconcile(config.run_as_admin) {
+        log::warn!("unable to update the startup entry: {error}");
+    }
     let monitor_mode = MonitorMode::parse(&config.show_switcher_on).unwrap_or_else(|| {
         log::warn!(
             "unknown show_switcher_on value {:?}; using primary",
@@ -123,6 +160,8 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     });
     VERTICAL_LAYOUT.store(layout == Layout::Vertical, Ordering::SeqCst);
     log::info!("layout: {}", layout.as_str());
+    SETTINGS_IN_SWITCHER.store(config.settings_in_switcher, Ordering::SeqCst);
+    log::info!("settings in switcher: {}", config.settings_in_switcher);
     let (window_shortcut, app_shortcut) =
         startup_shortcuts(&config.window_hotkey, &config.app_hotkey);
     log::info!(
@@ -147,6 +186,10 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         return Err(error.into());
     }
     log::info!("tray icon installed");
+    if launch.open_settings {
+        // Restarted from Settings: show it again.
+        open_settings(app.handle());
+    }
 
     if let Some(overlay) = app.get_webview_window(OVERLAY_LABEL) {
         prepare_overlay_window(&overlay);

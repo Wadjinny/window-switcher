@@ -114,6 +114,13 @@ pub(crate) static MONITOR_MODE: AtomicU8 = AtomicU8::new(0);
 pub(crate) static PREVIEW_CARDS: AtomicBool = AtomicBool::new(false);
 /// `true` while cards are stacked vertically instead of side by side.
 pub(crate) static VERTICAL_LAYOUT: AtomicBool = AtomicBool::new(false);
+/// `true` while the Settings window is listed and switched from like any
+/// other window. Stored in `config.json` as `settings_in_switcher`.
+pub(crate) static SETTINGS_IN_SWITCHER: AtomicBool = AtomicBool::new(false);
+/// `true` while "Run as administrator" is on. Stored in `config.json` as
+/// `run_as_admin`; whether this process actually is elevated is
+/// `elevation::is_elevated`.
+pub(crate) static RUN_AS_ADMIN: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn current_monitor_mode() -> MonitorMode {
     MonitorMode::from_u8(MONITOR_MODE.load(Ordering::SeqCst))
@@ -138,7 +145,7 @@ pub(crate) fn current_card_style() -> CardStyle {
 pub(crate) fn apply_monitor_mode(app: &AppHandle, value: &str) -> Result<(), String> {
     let mode =
         MonitorMode::parse(value).ok_or_else(|| format!("unknown monitor mode {value:?}"))?;
-    persist(&[("show_switcher_on", mode.as_str().to_string())], || {
+    persist(&[("show_switcher_on", mode.as_str().into())], || {
         MONITOR_MODE.store(mode.to_u8(), Ordering::SeqCst)
     })?;
     log::info!("switcher shows on: {}", mode.as_str());
@@ -173,8 +180,8 @@ pub(crate) fn apply_hotkey(app: &AppHandle, key: &str, value: &str) -> Result<()
         save_config_values(
             &lock,
             &[
-                ("window_hotkey", window.config_value()),
-                ("app_hotkey", apps.config_value()),
+                ("window_hotkey", window.config_value().into()),
+                ("app_hotkey", apps.config_value().into()),
             ],
         )?;
         store_shortcuts(window, apps);
@@ -192,7 +199,7 @@ pub(crate) fn apply_hotkey(app: &AppHandle, key: &str, value: &str) -> Result<()
 /// Takes effect the next time the switcher opens.
 pub(crate) fn apply_card_style(value: &str) -> Result<(), String> {
     let style = CardStyle::parse(value).ok_or_else(|| format!("unknown card style {value:?}"))?;
-    persist(&[("card_style", style.as_str().to_string())], || {
+    persist(&[("card_style", style.as_str().into())], || {
         PREVIEW_CARDS.store(style == CardStyle::Preview, Ordering::SeqCst)
     })?;
     log::info!("card style: {}", style.as_str());
@@ -202,9 +209,29 @@ pub(crate) fn apply_card_style(value: &str) -> Result<(), String> {
 /// Takes effect the next time the switcher opens.
 pub(crate) fn apply_layout(value: &str) -> Result<(), String> {
     let layout = Layout::parse(value).ok_or_else(|| format!("unknown layout {value:?}"))?;
-    persist(&[("layout", layout.as_str().to_string())], || {
+    persist(&[("layout", layout.as_str().into())], || {
         VERTICAL_LAYOUT.store(layout == Layout::Vertical, Ordering::SeqCst)
     })?;
     log::info!("layout: {}", layout.as_str());
     Ok(())
+}
+
+/// Takes effect on the next key press: the hook and the window list read it
+/// each time.
+pub(crate) fn apply_settings_in_switcher(value: &str) -> Result<(), String> {
+    let enabled = parse_toggle("settings_in_switcher", value)?;
+    persist(&[("settings_in_switcher", enabled.into())], || {
+        SETTINGS_IN_SWITCHER.store(enabled, Ordering::SeqCst)
+    })?;
+    log::info!("settings in switcher: {enabled}");
+    Ok(())
+}
+
+/// On/off settings arrive from the Settings window as "true" or "false".
+pub(crate) fn parse_toggle(key: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!("{key} must be true or false, not {value:?}")),
+    }
 }
