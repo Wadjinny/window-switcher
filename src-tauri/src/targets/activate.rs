@@ -21,6 +21,9 @@ const DISMISS_TIMEOUT: Duration = Duration::from_millis(600);
 const SETTLE_TIME: Duration = Duration::from_millis(120);
 /// How long to wait for the asynchronous `SwitchToThisWindow`.
 const SWITCH_TIMEOUT: Duration = Duration::from_millis(250);
+/// How long a minimized window gets to handle its restore before it is
+/// asked once more.
+const RESTORE_TIMEOUT: Duration = Duration::from_millis(300);
 const POLL: Duration = Duration::from_millis(5);
 
 /// Brings `hwnd` to the front from the controller thread. Never waits on the
@@ -32,11 +35,41 @@ pub(crate) fn activate_window(hwnd: HWND) -> bool {
             log::warn!("cannot activate a window that no longer exists");
             return false;
         }
-        if IsIconic(hwnd).as_bool() {
-            // Asynchronous: `ShowWindow` on another process's window waits
-            // for that process to handle the restore.
-            let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+        let activated = bring_to_front(hwnd);
+        if activated && IsIconic(hwnd).as_bool() {
+            restore(hwnd);
         }
+        activated
+    }
+}
+
+/// Restores a minimized window once it has the foreground. Restoring it
+/// earlier is unreliable: the app handles the restore itself, and while it
+/// may not take the foreground yet, Windows can leave the window minimized
+/// (the bug where the first switch to a minimized window did nothing).
+unsafe fn restore(hwnd: HWND) {
+    // Asynchronous: `ShowWindow` on another process's window waits for that
+    // process to handle the restore.
+    let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+    if wait_for(RESTORE_TIMEOUT, || !IsIconic(hwnd).as_bool()) {
+        return;
+    }
+    // Still minimized: ask once more, then take the foreground again since
+    // the restore activates the window. Only sent while the window is
+    // minimized, as SW_RESTORE on a maximized window would un-maximize it.
+    log::info!("the window stayed minimized; restoring it again");
+    let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+    if wait_for(RESTORE_TIMEOUT, || !IsIconic(hwnd).as_bool()) {
+        let _ = set_foreground(hwnd);
+    } else {
+        log::warn!("the selected window did not restore");
+    }
+}
+
+/// Gives `hwnd` the foreground, closing Task View or a shell flyout first if
+/// one holds it.
+unsafe fn bring_to_front(hwnd: HWND) -> bool {
+    unsafe {
         if set_foreground(hwnd) {
             return true;
         }
