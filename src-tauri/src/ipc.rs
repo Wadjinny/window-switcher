@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, WebviewWindow};
 
 use crate::{
+    colors::AppColors,
     config::{lock_config, persist, save_config_values},
     elevation::{is_elevated, relaunch_elevated},
     hotkey::{
@@ -37,6 +38,8 @@ pub(crate) struct SwitchItem {
     pub(crate) subtitle: String,
     pub(crate) icon: Option<String>,
     pub(crate) accent: String,
+    /// Theme colors from the app's icon; `None` for a neutral or missing icon.
+    pub(crate) colors: Option<AppColors>,
     pub(crate) window_count: usize,
     /// Preview style only: the overlay shows a live thumbnail of window `id`
     /// in this card. False for minimized windows, which DWM cannot render.

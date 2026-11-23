@@ -4,6 +4,7 @@ import {
   checkIconSource,
   parsePayload,
   parseSelection,
+  type AppColors,
   type CardStyle,
   type Layout,
   type Mode,
@@ -159,6 +160,18 @@ function setCardIcon(card: CardView, icon: string | null): void {
   if (timingEnabled) pendingIconDecodes.push(decoded);
 }
 
+/** Tints the card with its app's colors (see colors.rs). */
+function setCardColors(element: HTMLElement, colors: AppColors | null): void {
+  element.classList.toggle("themed", colors !== null);
+  if (colors) {
+    element.style.setProperty("--app-fill", colors.fill);
+    element.style.setProperty("--app-border", colors.border);
+  } else {
+    element.style.removeProperty("--app-fill");
+    element.style.removeProperty("--app-border");
+  }
+}
+
 function setCardData(card: CardView, item: SwitchItem, mode: Mode): void {
   if (card.titleText.data !== item.title) card.titleText.data = item.title;
   card.titleElement.title = item.title;
@@ -171,6 +184,7 @@ function setCardData(card: CardView, item: SwitchItem, mode: Mode): void {
   card.element.classList.toggle("no-subtitle", item.subtitle.length === 0);
 
   card.fallback.style.setProperty("--accent", item.accent);
+  setCardColors(card.element, item.colors);
   const letter = initialLetter(item.title || item.subtitle);
   if (card.fallback.textContent !== letter) card.fallback.textContent = letter;
 

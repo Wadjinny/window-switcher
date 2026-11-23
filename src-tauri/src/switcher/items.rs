@@ -3,7 +3,7 @@
 use windows::Win32::UI::WindowsAndMessaging::IsIconic;
 
 use crate::{
-    icons::{cache_lookup, icon_cache, name_cache},
+    icons::{app_colors, cache_lookup, icon_cache, name_cache},
     ipc::SwitchItem,
     settings_model::CardStyle,
     targets::{
@@ -33,6 +33,7 @@ pub(crate) fn target_to_item_cached(target: &Target, style: CardStyle) -> Switch
         subtitle: subtitle.clone(),
         icon: cache_lookup(icon_cache(), &key).flatten(),
         accent: accent_for(&subtitle),
+        colors: app_colors(&key),
         window_count: target.window_count,
         // IsIconic is a cheap user32 read, safe on the hook thread.
         thumbnail: style == CardStyle::Preview && !unsafe { IsIconic(target.hwnd) }.as_bool(),

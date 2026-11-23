@@ -3,6 +3,7 @@ import {
   DEFAULT_ACCENT,
   MAX_ICON_LENGTH,
   checkIconSource,
+  parseColors,
   parseItem,
   parsePayload,
   parseSelection,
@@ -17,6 +18,7 @@ function item(overrides: Record<string, unknown> = {}): Record<string, unknown> 
     subtitle: "Mail",
     icon: PNG,
     accent: "#8b54d6",
+    colors: { fill: "#1e78dc", border: "#e63c32" },
     window_count: 2,
     thumbnail: true,
     ...overrides,
@@ -49,6 +51,7 @@ describe("parsePayload", () => {
           subtitle: "Mail",
           icon: PNG,
           accent: "#8b54d6",
+          colors: { fill: "#1e78dc", border: "#e63c32" },
           window_count: 2,
           thumbnail: true,
         },
@@ -58,6 +61,7 @@ describe("parsePayload", () => {
           subtitle: "Editor",
           icon: PNG,
           accent: "#8b54d6",
+          colors: { fill: "#1e78dc", border: "#e63c32" },
           window_count: 2,
           thumbnail: true,
         },
@@ -125,6 +129,18 @@ describe("parseItem", () => {
       window_count: 3,
     });
     expect(parseItem(item({ window_count: Number.POSITIVE_INFINITY }))?.window_count).toBe(1);
+  });
+
+  it("keeps theme colors only when both are hex colors", () => {
+    expect(parseItem(item({ colors: { fill: "#1e78dc", border: "#E63C32" } }))?.colors).toEqual({
+      fill: "#1e78dc",
+      border: "#E63C32",
+    });
+    expect(parseItem(item({ colors: null }))?.colors).toBeNull();
+    expect(parseColors({ fill: "#1e78dc" })).toBeNull();
+    expect(parseColors({ fill: "red", border: "#e63c32" })).toBeNull();
+    expect(parseColors({ fill: "#1e78dc;x:y", border: "#e63c32" })).toBeNull();
+    expect(parseColors("#1e78dc")).toBeNull();
   });
 
   it("requires a finite numeric id", () => {

@@ -5,12 +5,16 @@ export type Mode = "window" | "app";
 export type CardStyle = "icon" | "preview";
 export type Layout = "horizontal" | "vertical";
 
+/** Theme colors from the app's icon: the card fill and its border. */
+export type AppColors = { fill: string; border: string };
+
 export type SwitchItem = {
   id: number;
   title: string;
   subtitle: string;
   icon: string | null;
   accent: string;
+  colors: AppColors | null;
   window_count: number;
   /** Preview style: the backend draws a live thumbnail of window `id` here. */
   thumbnail: boolean;
@@ -56,6 +60,16 @@ export function checkIconSource(icon: string): string | null {
     : null;
 }
 
+const HEX_COLOR = /^#[0-9a-f]{6}$/i;
+
+/** The theme colors, or null unless both are `#rrggbb` (they end up in CSS). */
+export function parseColors(value: unknown): AppColors | null {
+  if (!isRecord(value)) return null;
+  const { fill, border } = value;
+  if (typeof fill !== "string" || typeof border !== "string") return null;
+  return HEX_COLOR.test(fill) && HEX_COLOR.test(border) ? { fill, border } : null;
+}
+
 export function parseItem(value: unknown): SwitchItem | null {
   if (!isRecord(value)) return null;
   const { id } = value;
@@ -83,6 +97,7 @@ export function parseItem(value: unknown): SwitchItem | null {
     subtitle: rawSubtitle,
     icon: typeof value.icon === "string" ? value.icon : null,
     accent,
+    colors: parseColors(value.colors),
     window_count: windowCount,
     thumbnail: value.thumbnail === true,
   };

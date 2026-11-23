@@ -38,6 +38,7 @@ use windows::{
 };
 
 use crate::{
+    colors::{dominant_colors, AppColors},
     switcher::{
         items::target_to_item_cached, session::payload_snapshot, HookRuntime, SWITCHER_GENERATION,
     },
@@ -55,6 +56,17 @@ use crate::{
 type TextCache = Mutex<HashMap<String, Option<String>>>;
 static ICON_CACHE: OnceLock<TextCache> = OnceLock::new();
 static NAME_CACHE: OnceLock<TextCache> = OnceLock::new();
+/// Theme colors taken from each icon, filled together with `ICON_CACHE`.
+type ColorCache = Mutex<HashMap<String, Option<AppColors>>>;
+static COLOR_CACHE: OnceLock<ColorCache> = OnceLock::new();
+
+pub(crate) fn app_colors(key: &str) -> Option<AppColors> {
+    COLOR_CACHE
+        .get()
+        .and_then(|cache| cache.lock().ok())
+        .and_then(|entries| entries.get(key).cloned())
+        .flatten()
+}
 
 pub(crate) fn icon_cache() -> &'static TextCache {
     ICON_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -143,7 +155,15 @@ fn fill_item_caches(targets: &[Target], keep_going: impl Fn() -> bool) -> bool {
         }
         let key = target_key(target);
         if cache_lookup(icon_cache(), &key).is_none() {
-            cache_store(icon_cache(), &key, item_icon(target));
+            let image = item_icon(target);
+            let colors = image.as_ref().and_then(dominant_colors);
+            if let Ok(mut entries) = COLOR_CACHE
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+            {
+                entries.insert(key.clone(), colors);
+            }
+            cache_store(icon_cache(), &key, image.as_ref().and_then(png_data_uri));
         }
         if let Some(app_id) = &target.app_id {
             if cache_lookup(name_cache(), &key).is_none() {
@@ -176,16 +196,16 @@ pub(crate) fn warm_item_caches() {
     }
 }
 
-/// The card icon of `target` as a PNG data URI, rendered by the shell at
+/// The card icon of `target`, rendered by the shell at
 /// `icon_size()` pixels where possible so it stays sharp when drawn large.
 /// Only ever called from the item workers, never from the keyboard hook.
-fn item_icon(target: &Target) -> Option<String> {
+fn item_icon(target: &Target) -> Option<RgbaImage> {
     let size = icon_size();
     // Packaged apps and PWAs: the Start menu entry has the app's real icon,
     // which their windows (often hosted by another process) may not.
     if let Some(app_id) = &target.app_id {
         if let Some(image) = shell_image(&format!("shell:AppsFolder\\{app_id}"), size) {
-            return png_data_uri(&image);
+            return Some(image);
         }
     }
     let window = window_icon(target.hwnd);
@@ -200,10 +220,10 @@ fn item_icon(target: &Target) -> Option<String> {
     if shows_program_icon {
         let path = target.process_path.to_string_lossy();
         if let Some(image) = shell_image(&path, size) {
-            return png_data_uri(&image);
+            return Some(image);
         }
     }
-    window.or(program).as_ref().and_then(png_data_uri)
+    window.or(program)
 }
 
 /// Icon size to render: 48 logical pixels at the system DPI, enough for the
