@@ -2,7 +2,7 @@
   "name": "window-switcher",
   "private": true,
   "license": "MIT",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "dependencies": {
     "@tauri-apps/api": "^2.0.0"
