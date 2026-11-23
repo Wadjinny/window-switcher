@@ -280,6 +280,19 @@ pub(crate) struct ThumbnailSlot {
     pub(crate) y: f64,
     pub(crate) width: f64,
     pub(crate) height: f64,
+    /// Where the card's app icon sits over the preview's corner, when the
+    /// card has an icon (see `icon_layer.rs`).
+    #[serde(default)]
+    pub(crate) icon: Option<SlotRect>,
+}
+
+/// A rectangle in CSS pixels relative to the viewport.
+#[derive(Clone, Copy, Deserialize)]
+pub(crate) struct SlotRect {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) width: f64,
+    pub(crate) height: f64,
 }
 
 /// Latency logging only: the overlay reports when it rendered or painted an

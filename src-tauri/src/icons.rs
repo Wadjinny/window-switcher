@@ -12,19 +12,23 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use image::{ImageFormat, RgbaImage};
+use image::{imageops, ImageFormat, RgbaImage};
 use tauri::Emitter;
 use windows::{
     core::PCWSTR,
     Win32::{
-        Foundation::{HWND, LPARAM, WPARAM},
+        Foundation::{HWND, LPARAM, SIZE, WPARAM},
         Graphics::Gdi::{
             DeleteObject, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER,
-            BI_RGB, DIB_RGB_COLORS, HDC,
+            BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
         },
         System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED},
         UI::{
-            Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON},
+            HiDpi::GetDpiForSystem,
+            Shell::{
+                IShellItemImageFactory, SHCreateItemFromParsingName, SHGetFileInfoW, SHFILEINFOW,
+                SHGFI_ICON, SHGFI_LARGEICON, SIIGBF_ICONONLY,
+            },
             WindowsAndMessaging::{
                 GetClassLongPtrW, GetIconInfo, SendMessageTimeoutW, GCLP_HICON, HICON, ICONINFO,
                 ICON_BIG, SMTO_ABORTIFHUNG, WM_GETICON,
@@ -139,8 +143,7 @@ fn fill_item_caches(targets: &[Target], keep_going: impl Fn() -> bool) -> bool {
         }
         let key = target_key(target);
         if cache_lookup(icon_cache(), &key).is_none() {
-            let icon = window_icon(target.hwnd).or_else(|| icon_for_path(&target.process_path));
-            cache_store(icon_cache(), &key, icon);
+            cache_store(icon_cache(), &key, item_icon(target));
         }
         if let Some(app_id) = &target.app_id {
             if cache_lookup(name_cache(), &key).is_none() {
@@ -173,10 +176,159 @@ pub(crate) fn warm_item_caches() {
     }
 }
 
+/// The card icon of `target` as a PNG data URI, rendered by the shell at
+/// `icon_size()` pixels where possible so it stays sharp when drawn large.
+/// Only ever called from the item workers, never from the keyboard hook.
+fn item_icon(target: &Target) -> Option<String> {
+    let size = icon_size();
+    // Packaged apps and PWAs: the Start menu entry has the app's real icon,
+    // which their windows (often hosted by another process) may not.
+    if let Some(app_id) = &target.app_id {
+        if let Some(image) = shell_image(&format!("shell:AppsFolder\\{app_id}"), size) {
+            return png_data_uri(&image);
+        }
+    }
+    let window = window_icon(target.hwnd);
+    let program = icon_for_path(&target.process_path);
+    // A window may show another icon than its program (script hosts such as
+    // python.exe or mmc.exe): only then is the window's own small icon kept.
+    let shows_program_icon = match (&window, &program) {
+        (None, _) => true,
+        (Some(window), Some(program)) => looks_alike(window, program),
+        (Some(_), None) => false,
+    };
+    if shows_program_icon {
+        let path = target.process_path.to_string_lossy();
+        if let Some(image) = shell_image(&path, size) {
+            return png_data_uri(&image);
+        }
+    }
+    window.or(program).as_ref().and_then(png_data_uri)
+}
+
+/// Icon size to render: 48 logical pixels at the system DPI, enough for the
+/// largest place an icon is drawn (the preview cards' corner icon).
+fn icon_size() -> u32 {
+    let dpi = unsafe { GetDpiForSystem() }.max(96);
+    (48 * dpi / 96).clamp(48, 128)
+}
+
+/// True when two icons show the same picture, allowing for a different size.
+fn looks_alike(a: &RgbaImage, b: &RgbaImage) -> bool {
+    const SIDE: u32 = 16;
+    let a = imageops::resize(a, SIDE, SIDE, imageops::FilterType::Triangle);
+    let b = imageops::resize(b, SIDE, SIDE, imageops::FilterType::Triangle);
+    let total: u64 = a
+        .as_raw()
+        .iter()
+        .zip(b.as_raw())
+        .map(|(x, y)| x.abs_diff(*y) as u64)
+        .sum();
+    total / (SIDE * SIDE * 4) as u64 <= 24
+}
+
+/// The icon the shell shows for `parsing_name` (a path, or a
+/// `shell:AppsFolder\<AUMID>` entry), rendered at up to `size` pixels.
+fn shell_image(parsing_name: &str, size: u32) -> Option<RgbaImage> {
+    let wide: Vec<u16> = parsing_name.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let factory: IShellItemImageFactory =
+            SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
+        let requested = SIZE {
+            cx: size as i32,
+            cy: size as i32,
+        };
+        let bitmap = factory.GetImage(requested, SIIGBF_ICONONLY).ok()?;
+        let image = bitmap_to_rgba(bitmap);
+        let _ = DeleteObject(bitmap.into());
+        let image = image?;
+        if image.width() > size || image.height() > size {
+            return Some(imageops::resize(
+                &image,
+                size,
+                size,
+                imageops::FilterType::Lanczos3,
+            ));
+        }
+        Some(image)
+    }
+}
+
+/// A 32bpp shell bitmap as straight-alpha RGBA.
+unsafe fn bitmap_to_rgba(bitmap: HBITMAP) -> Option<RgbaImage> {
+    let mut info = BITMAP::default();
+    if GetObjectW(
+        bitmap.into(),
+        std::mem::size_of::<BITMAP>() as i32,
+        Some(&mut info as *mut _ as *mut c_void),
+    ) == 0
+    {
+        return None;
+    }
+    let width = info.bmWidth;
+    let height = info.bmHeight.unsigned_abs() as i32;
+    if width <= 0 || height <= 0 || width > 1024 || height > 1024 {
+        return None;
+    }
+    let mut bgra = vec![0u8; width as usize * height as usize * 4];
+    let mut bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let dc = windows::Win32::Graphics::Gdi::GetDC(None);
+    let copied = GetDIBits(
+        dc,
+        bitmap,
+        0,
+        height as u32,
+        Some(bgra.as_mut_ptr() as *mut c_void),
+        &mut bmi,
+        DIB_RGB_COLORS,
+    );
+    let _ = ReleaseDC(None, dc);
+    if copied == 0 {
+        return None;
+    }
+    unpremultiply_bgra(&mut bgra);
+    RgbaImage::from_raw(width as u32, height as u32, bgra)
+}
+
+/// Turns the shell's BGRA pixels into straight-alpha RGBA. The shell hands
+/// out premultiplied pixels (no channel above its alpha); a bitmap that
+/// breaks that rule is taken as straight alpha, and one with no alpha at all
+/// as opaque.
+fn unpremultiply_bgra(bgra: &mut [u8]) {
+    let pixels = bgra.as_chunks_mut::<4>().0;
+    let has_alpha = pixels.iter().any(|pixel| pixel[3] != 0);
+    let premultiplied = has_alpha
+        && pixels
+            .iter()
+            .all(|pixel| pixel[0].max(pixel[1]).max(pixel[2]) <= pixel[3]);
+    for pixel in pixels {
+        pixel.swap(0, 2);
+        if !has_alpha {
+            pixel[3] = 255;
+        } else if premultiplied && pixel[3] != 0 && pixel[3] != 255 {
+            let alpha = pixel[3] as u32;
+            for channel in &mut pixel[..3] {
+                *channel = ((*channel as u32 * 255 + alpha / 2) / alpha).min(255) as u8;
+            }
+        }
+    }
+}
+
 /// The window's own icon (PWAs and UWP apps use a different one than their
 /// host process). The returned handle belongs to the window, so it is not freed.
 /// Only ever called from the item worker, never from the keyboard hook.
-fn window_icon(hwnd: HWND) -> Option<String> {
+fn window_icon(hwnd: HWND) -> Option<RgbaImage> {
     unsafe {
         let mut result = 0usize;
         let _ = SendMessageTimeoutW(
@@ -195,11 +347,11 @@ fn window_icon(hwnd: HWND) -> Option<String> {
         if icon.is_null() {
             return None;
         }
-        icon_to_data_uri(HICON(icon))
+        icon_to_rgba(HICON(icon))
     }
 }
 
-fn icon_for_path(path: &Path) -> Option<String> {
+fn icon_for_path(path: &Path) -> Option<RgbaImage> {
     let path_wide = path
         .as_os_str()
         .encode_wide()
@@ -217,13 +369,13 @@ fn icon_for_path(path: &Path) -> Option<String> {
         if info.hIcon.0.is_null() {
             return None;
         }
-        let encoded = icon_to_data_uri(info.hIcon);
+        let encoded = icon_to_rgba(info.hIcon);
         let _ = windows::Win32::UI::WindowsAndMessaging::DestroyIcon(info.hIcon);
         encoded
     }
 }
 
-unsafe fn icon_to_data_uri(icon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Option<String> {
+unsafe fn icon_to_rgba(icon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Option<RgbaImage> {
     let mut icon_info = ICONINFO::default();
     GetIconInfo(icon, &mut icon_info).ok()?;
     let color_bitmap = icon_info.hbmColor;
@@ -331,10 +483,49 @@ unsafe fn icon_to_data_uri(icon: windows::Win32::UI::WindowsAndMessaging::HICON)
             None => 255,
         };
     }
-    let image = RgbaImage::from_raw(width as u32, height as u32, bgra)?;
+    RgbaImage::from_raw(width as u32, height as u32, bgra)
+}
+
+fn png_data_uri(image: &RgbaImage) -> Option<String> {
     let mut png = Vec::new();
     image
         .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
         .ok()?;
     Some(format!("data:image/png;base64,{}", BASE64.encode(png)))
+}
+
+#[cfg(test)]
+mod shell_pixel_tests {
+    use super::*;
+
+    #[test]
+    fn premultiplied_pixels_are_unpremultiplied_and_swapped() {
+        // BGRA: blue 0, green 0, red 64 at alpha 128 -> RGBA red 128.
+        let mut pixels = vec![0, 0, 64, 128, 10, 20, 30, 255];
+        unpremultiply_bgra(&mut pixels);
+        assert_eq!(pixels, vec![128, 0, 0, 128, 30, 20, 10, 255]);
+    }
+
+    #[test]
+    fn straight_alpha_pixels_are_kept() {
+        let mut pixels = vec![0, 0, 200, 100];
+        unpremultiply_bgra(&mut pixels);
+        assert_eq!(pixels, vec![200, 0, 0, 100]);
+    }
+
+    #[test]
+    fn a_bitmap_without_alpha_is_opaque() {
+        let mut pixels = vec![1, 2, 3, 0];
+        unpremultiply_bgra(&mut pixels);
+        assert_eq!(pixels, vec![3, 2, 1, 255]);
+    }
+
+    #[test]
+    fn icons_of_different_sizes_can_look_alike() {
+        let small = RgbaImage::from_pixel(32, 32, image::Rgba([200, 30, 30, 255]));
+        let large = RgbaImage::from_pixel(48, 48, image::Rgba([200, 30, 30, 255]));
+        let other = RgbaImage::from_pixel(32, 32, image::Rgba([30, 30, 200, 255]));
+        assert!(looks_alike(&small, &large));
+        assert!(!looks_alike(&small, &other));
+    }
 }

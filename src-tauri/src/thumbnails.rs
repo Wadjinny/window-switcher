@@ -18,6 +18,7 @@ use windows::Win32::{
 };
 
 use crate::{
+    icon_layer::{self, CornerIcon},
     ipc::ThumbnailSlot,
     overlay::{extra_overlay_index, OVERLAY_LABEL},
     settings_model::CardStyle,
@@ -94,7 +95,7 @@ pub(crate) fn place_thumbnails(
                     .items
                     .iter()
                     .filter(|item| item.thumbnail)
-                    .map(|item| item.id)
+                    .map(|item| (item.id, item.icon.clone()))
                     .collect::<Vec<_>>(),
             )
         });
@@ -105,10 +106,14 @@ pub(crate) fn place_thumbnails(
 
     let sources = map.entry(destination.0 as isize).or_default();
     let mut wanted = Vec::with_capacity(slots.len());
+    let mut icons = Vec::new();
     for slot in &slots {
         // Only windows on the current cards: the webview cannot ask for a
         // preview of an arbitrary window.
-        if !allowed.contains(&slot.id) || wanted.contains(&(slot.id as isize)) {
+        let Some((_, icon)) = allowed.iter().find(|(id, _)| *id == slot.id) else {
+            continue;
+        };
+        if wanted.contains(&(slot.id as isize)) {
             continue;
         }
         let source = slot.id as isize;
@@ -143,6 +148,12 @@ pub(crate) fn place_thumbnails(
         if let Err(error) = unsafe { DwmUpdateThumbnailProperties(thumbnail, &properties) } {
             log::debug!("unable to place a window preview: {error}");
         }
+        if let (Some(rect), Some(icon)) = (slot.icon, icon) {
+            icons.push(CornerIcon {
+                rect,
+                icon: icon.clone(),
+            });
+        }
     }
     sources.retain(|source, thumbnail| {
         let keep = wanted.contains(source);
@@ -153,12 +164,44 @@ pub(crate) fn place_thumbnails(
         }
         keep
     });
+    drop(map);
+    show_corner_icons(window, generation, destination, scale, icons);
     timing::since_open(
         generation,
         "thumbnails placed",
         &format!("{} on {label}", wanted.len()),
     );
     Ok(())
+}
+
+/// Draws the app icons over the previews' corners on the main thread, which
+/// owns the icon layer windows, unless the switcher closed or reopened in the
+/// meantime (hiding queues `icon_layer::hide_all` on the same thread).
+fn show_corner_icons(
+    window: &WebviewWindow,
+    generation: u64,
+    destination: HWND,
+    scale: f64,
+    icons: Vec<CornerIcon>,
+) {
+    let overlay = destination.0 as isize;
+    let queued = window.run_on_main_thread(move || {
+        let current = RUNTIME
+            .get()
+            .and_then(|runtime| runtime.state.lock().ok())
+            .is_some_and(|state| {
+                state
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.generation == generation)
+            });
+        if current {
+            icon_layer::show_icons(HWND(overlay as *mut c_void), scale, &icons);
+        }
+    });
+    if let Err(error) = queued {
+        log::debug!("unable to queue the preview icons: {error}");
+    }
 }
 
 /// The slot in physical client pixels, shrunk to the source window's aspect
@@ -204,6 +247,7 @@ mod tests {
             y,
             width,
             height,
+            icon: None,
         }
     }
 

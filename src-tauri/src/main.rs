@@ -3,6 +3,7 @@
 mod config;
 mod elevation;
 mod hotkey;
+mod icon_layer;
 mod icons;
 mod input;
 mod ipc;

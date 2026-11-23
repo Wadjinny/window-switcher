@@ -475,9 +475,13 @@ pub(crate) fn prepare_overlay_window(window: &WebviewWindow) {
     }
 }
 
-/// Hides the overlay on every monitor and drops its window previews.
+/// Hides the overlay on every monitor and drops its window previews and
+/// their icons.
 pub(crate) fn hide_overlay(app: &AppHandle) {
     clear_thumbnails();
+    // The icon layers belong to the main thread; queued before the hides
+    // below, so they never outlive the overlay on screen.
+    let _ = app.run_on_main_thread(crate::icon_layer::hide_all);
     for (label, window) in app.webview_windows() {
         if label == OVERLAY_LABEL || extra_overlay_index(&label).is_some() {
             let _ = window.hide();

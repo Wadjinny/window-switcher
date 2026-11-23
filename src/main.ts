@@ -69,7 +69,6 @@ type CardView = {
   thumb: HTMLElement | null;
   /** Preview style only: shown in the slot when there is no thumbnail. */
   thumbFallback: HTMLElement | null;
-  thumbIcon: HTMLImageElement | null;
   thumbnail: boolean;
 };
 
@@ -98,7 +97,6 @@ function setCardIcon(card: CardView, icon: string | null): void {
   const source = safeIconSource(icon);
 
   if (source === null) {
-    if (card.thumbIcon) card.thumbIcon.hidden = true;
     if (card.iconSource === null && card.image === null) {
       card.fallback.hidden = false;
       return;
@@ -125,10 +123,6 @@ function setCardIcon(card: CardView, icon: string | null): void {
     card.shell.append(image);
     card.fallback.hidden = true;
     card.failedSource = null;
-    if (card.thumbIcon) {
-      card.thumbIcon.src = source;
-      card.thumbIcon.hidden = false;
-    }
   };
 
   if (decodedIcons.has(source)) {
@@ -194,30 +188,24 @@ function setCardData(card: CardView, item: SwitchItem, mode: Mode): void {
   card.id = item.id;
   card.thumbnail = item.thumbnail;
   if (card.thumbFallback) card.thumbFallback.hidden = item.thumbnail;
+  // Over a live preview the backend draws this icon (with its shadow) again
+  // on top, so the HTML copy drops its own shadow there.
+  card.element.classList.toggle("live", item.thumbnail);
 
   setCardIcon(card, item.icon);
 }
 
 /** Preview slot: the backend draws the thumbnail over it, or, for a
- * minimized window, the app icon is shown instead. */
-function createThumb(): {
-  thumb: HTMLElement;
-  thumbFallback: HTMLElement;
-  thumbIcon: HTMLImageElement;
-} {
+ * minimized window, a note is shown instead. */
+function createThumb(): { thumb: HTMLElement; thumbFallback: HTMLElement } {
   const thumb = document.createElement("div");
   thumb.className = "thumb";
 
   const thumbFallback = document.createElement("div");
   thumbFallback.className = "thumb-fallback";
-  const thumbIcon = document.createElement("img");
-  thumbIcon.alt = "";
-  thumbIcon.hidden = true;
-  const note = document.createElement("span");
-  note.textContent = "Minimized";
-  thumbFallback.append(thumbIcon, note);
+  thumbFallback.textContent = "Minimized";
   thumb.append(thumbFallback);
-  return { thumb, thumbFallback, thumbIcon };
+  return { thumb, thumbFallback };
 }
 
 function createCard(item: SwitchItem, mode: Mode, style: CardStyle): CardView {
@@ -257,13 +245,16 @@ function createCard(item: SwitchItem, mode: Mode, style: CardStyle): CardView {
 
   let preview: ReturnType<typeof createThumb> | null = null;
   if (style === "preview") {
-    // Like the built-in Alt+Tab: the live preview, then a small icon, the
-    // window title and the window count underneath.
+    // The live preview with a large app icon over its top-left corner, then
+    // the window title and the window count underneath. The backend repeats
+    // the icon above the preview (see icon_layer.rs): DWM draws previews over
+    // the HTML, which would otherwise hide the part of the icon it overlaps.
     preview = createThumb();
+    shell.classList.add("corner-icon");
     const labelRow = document.createElement("div");
     labelRow.className = "label-row";
-    labelRow.append(shell, titleElement, countElement);
-    element.append(preview.thumb, labelRow);
+    labelRow.append(titleElement, countElement);
+    element.append(preview.thumb, shell, labelRow);
   } else {
     ring.append(shell);
     element.append(ring, titleElement, subtitleElement, countElement);
@@ -286,7 +277,6 @@ function createCard(item: SwitchItem, mode: Mode, style: CardStyle): CardView {
     id: item.id,
     thumb: preview?.thumb ?? null,
     thumbFallback: preview?.thumbFallback ?? null,
-    thumbIcon: preview?.thumbIcon ?? null,
     thumbnail: item.thumbnail,
   };
 
@@ -510,7 +500,20 @@ function scheduleThumbnailReport(): void {
         box.left >= frame.left - 1 &&
         box.right <= frame.right + 1;
       if (!visible) continue;
-      slots.push({ id: card.id, x: box.left, y: box.top, width: box.width, height: box.height });
+      // Sent once the card has an icon, so the report changes (and the
+      // backend draws it) when an icon arrives after the opening.
+      const iconBox = card.iconSource !== null ? card.shell.getBoundingClientRect() : null;
+      const icon = iconBox
+        ? { x: iconBox.left, y: iconBox.top, width: iconBox.width, height: iconBox.height }
+        : null;
+      slots.push({
+        id: card.id,
+        x: box.left,
+        y: box.top,
+        width: box.width,
+        height: box.height,
+        icon,
+      });
     }
     const request = {
       generation: view.generation,
