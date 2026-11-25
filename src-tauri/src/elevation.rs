@@ -71,8 +71,8 @@ impl LaunchArgs {
     }
 }
 
-/// The arguments given to the elevated copy.
-fn relaunch_parameters(pid: u32, open_settings: bool) -> String {
+/// The arguments given to the elevated copy (and to a freshly updated one).
+pub(crate) fn relaunch_parameters(pid: u32, open_settings: bool) -> String {
     let mut parameters = format!("{REPLACES_FLAG} {pid}");
     if open_settings {
         parameters.push(' ');

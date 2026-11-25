@@ -5,7 +5,7 @@
 use std::sync::atomic::Ordering;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, WebviewWindow};
+use tauri::{AppHandle, Emitter, WebviewWindow};
 
 use crate::{
     colors::AppColors,
@@ -29,6 +29,7 @@ use crate::{
     },
     thumbnails, timing,
     tray::refresh_tray_tooltip,
+    update,
 };
 
 #[derive(Clone, Serialize)]
@@ -144,6 +145,7 @@ pub(crate) struct SettingsPayload {
     /// `config.json` (see `startup.rs`).
     start_with_windows: bool,
     run_as_admin: bool,
+    check_for_updates: bool,
     /// Whether this process is elevated (read-only).
     running_as_admin: bool,
 }
@@ -159,6 +161,7 @@ pub(crate) fn get_settings() -> SettingsPayload {
         settings_in_switcher: SETTINGS_IN_SWITCHER.load(Ordering::SeqCst),
         start_with_windows: startup::is_enabled(),
         run_as_admin: RUN_AS_ADMIN.load(Ordering::SeqCst),
+        check_for_updates: update::AUTO_CHECK.load(Ordering::SeqCst),
         running_as_admin: is_elevated(),
     }
 }
@@ -185,6 +188,7 @@ pub(crate) async fn set_setting(
         "settings_in_switcher" => apply_settings_in_switcher(&value)?,
         "start_with_windows" => apply_start_with_windows(&value)?,
         "run_as_admin" => apply_run_as_admin(&app, &value)?,
+        "check_for_updates" => apply_check_for_updates(&app, &value)?,
         _ => return Err(format!("unknown setting {key:?}")),
     }
     Ok(get_settings())
@@ -239,6 +243,45 @@ fn apply_run_as_admin(app: &AppHandle, value: &str) -> Result<(), String> {
         log::warn!("unable to update the startup entry: {error}");
     }
     Ok(())
+}
+
+/// Turns the automatic update checks on or off. Turned on, it checks now.
+fn apply_check_for_updates(app: &AppHandle, value: &str) -> Result<(), String> {
+    let enabled = parse_toggle("check_for_updates", value)?;
+    persist(&[("check_for_updates", enabled.into())], || {
+        update::AUTO_CHECK.store(enabled, Ordering::SeqCst)
+    })?;
+    log::info!("check for updates: {enabled}");
+    let _ = app.emit(update::STATUS_EVENT, update::payload());
+    if enabled {
+        let app = app.clone();
+        std::thread::spawn(move || update::check(&app, true));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn get_update_status() -> update::UpdatePayload {
+    update::payload()
+}
+
+/// Checks GitHub now and returns the result. Async: it blocks on the network.
+#[tauri::command]
+pub(crate) async fn check_for_updates(app: AppHandle) -> update::UpdatePayload {
+    update::check(&app, true);
+    update::payload()
+}
+
+/// Downloads and installs the available update, then restarts (Settings
+/// reopens). Progress and failures arrive as `update:status` events.
+#[tauri::command]
+pub(crate) fn install_update(app: AppHandle) {
+    update::install_in_background(&app, true);
+}
+
+#[tauri::command]
+pub(crate) fn open_release_page() {
+    update::open_release_page();
 }
 
 /// Restores both hotkeys to their defaults in one write.

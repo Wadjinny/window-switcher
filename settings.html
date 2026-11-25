@@ -130,6 +130,26 @@
           </label>
         </div>
       </fieldset>
+      <fieldset class="group">
+        <legend>Updates</legend>
+        <div class="card">
+          <div class="option update-row">
+            <span class="option-text">
+              <span class="option-title" id="update-title">Window Switcher</span>
+              <span class="option-detail" id="update-detail" aria-live="polite"></span>
+              <button type="button" class="link-button" id="release-notes" hidden>Release notes</button>
+            </span>
+            <button type="button" class="action-button" id="update-action">Check now</button>
+          </div>
+          <label class="option">
+            <input type="checkbox" name="check_for_updates" />
+            <span class="option-text">
+              <span class="option-title">Check for updates automatically</span>
+              <span class="option-detail">At startup and every 6 hours, from the GitHub releases. A notification says when one is out.</span>
+            </span>
+          </label>
+        </div>
+      </fieldset>
       <p class="note" id="status" role="status">Changes apply and save immediately.</p>
     </main>
     <script type="module" src="/src/settings.ts"></script>

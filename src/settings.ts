@@ -20,7 +20,12 @@ const CHOICES = {
 
 const HOTKEY_KEYS = ["app_hotkey", "window_hotkey"] as const;
 
-const TOGGLE_KEYS = ["settings_in_switcher", "start_with_windows", "run_as_admin"] as const;
+const TOGGLE_KEYS = [
+  "settings_in_switcher",
+  "start_with_windows",
+  "run_as_admin",
+  "check_for_updates",
+] as const;
 
 type ChoiceKey = keyof typeof CHOICES;
 type HotkeyKey = (typeof HOTKEY_KEYS)[number];
@@ -339,6 +344,125 @@ void listen<unknown>("settings:hotkey-recorded", ({ payload }) => {
 });
 
 // ---------------------------------------------------------------------------
+// Updates (see update/mod.rs). Not a setting: its own commands, and status
+// events while a check or an install runs.
+// ---------------------------------------------------------------------------
+
+type UpdateStatus = {
+  current: string;
+  available: string | null;
+  state: "idle" | "checking" | "up_to_date" | "available" | "installing" | "failed";
+  checked_at?: number;
+  version?: string;
+  message?: string;
+};
+
+const UPDATE_STATES = ["idle", "checking", "up_to_date", "available", "installing", "failed"];
+
+function parseUpdateStatus(value: unknown): UpdateStatus | null {
+  if (typeof value !== "object" || value === null) return null;
+  const v = value as Record<string, unknown>;
+  if (typeof v.current !== "string" || typeof v.state !== "string") return null;
+  if (!UPDATE_STATES.includes(v.state)) return null;
+  return {
+    current: v.current,
+    available: typeof v.available === "string" ? v.available : null,
+    state: v.state as UpdateStatus["state"],
+    checked_at: typeof v.checked_at === "number" ? v.checked_at : undefined,
+    version: typeof v.version === "string" ? v.version : undefined,
+    message: typeof v.message === "string" ? v.message : undefined,
+  };
+}
+
+const updateTitle = document.querySelector<HTMLElement>("#update-title")!;
+const updateDetail = document.querySelector<HTMLElement>("#update-detail")!;
+const updateAction = document.querySelector<HTMLButtonElement>("#update-action")!;
+const releaseNotes = document.querySelector<HTMLButtonElement>("#release-notes")!;
+let update: UpdateStatus | null = null;
+
+function timeAgo(unixSeconds: number): string {
+  const minutes = Math.max(0, Math.round((Date.now() / 1000 - unixSeconds) / 60));
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  return `${hours} h ago`;
+}
+
+function renderUpdate(status: UpdateStatus): void {
+  update = status;
+  updateTitle.textContent = `Window Switcher ${status.current}`;
+  let detail = "";
+  let action = "Check now";
+  let busy = false;
+  switch (status.state) {
+    case "idle":
+      detail = "Not checked yet.";
+      break;
+    case "checking":
+      detail = "Checking for updates…";
+      action = "Checking…";
+      busy = true;
+      break;
+    case "up_to_date":
+      detail = `Up to date. Checked ${timeAgo(status.checked_at ?? 0)}.`;
+      break;
+    case "available":
+      detail = `Version ${status.version} is available.`;
+      break;
+    case "installing":
+      detail = `Downloading ${status.version}; Window Switcher restarts when it is ready.`;
+      action = "Updating…";
+      busy = true;
+      break;
+    case "failed":
+      detail = status.message ?? "Something went wrong.";
+      break;
+  }
+  if (!busy && status.available) action = `Update to ${status.available}`;
+  updateDetail.textContent = detail;
+  updateDetail.classList.toggle("error", status.state === "failed");
+  updateAction.textContent = action;
+  updateAction.disabled = busy;
+  updateAction.classList.toggle("primary", !busy && status.available !== null);
+  releaseNotes.hidden = status.available === null;
+}
+
+async function loadUpdate(): Promise<void> {
+  try {
+    const status = parseUpdateStatus(await invoke<unknown>("get_update_status"));
+    if (status) renderUpdate(status);
+  } catch (error) {
+    console.error("Unable to read the update status", error);
+  }
+}
+
+updateAction.addEventListener("click", () => {
+  if (update?.available && update.state !== "installing") {
+    void invoke("install_update").catch((error: unknown) => {
+      setStatus(`Could not update: ${String(error)}`, true);
+    });
+    return;
+  }
+  void invoke<unknown>("check_for_updates")
+    .then((value) => {
+      const status = parseUpdateStatus(value);
+      if (status) renderUpdate(status);
+    })
+    .catch((error: unknown) => setStatus(`Could not check: ${String(error)}`, true));
+});
+
+releaseNotes.addEventListener("click", () => {
+  void invoke("open_release_page").catch(() => {});
+});
+
+void listen<unknown>("update:status", ({ payload }) => {
+  const status = parseUpdateStatus(payload);
+  if (status) renderUpdate(status);
+}).catch((error: unknown) => {
+  console.error("Unable to listen for update status", error);
+});
+
+// ---------------------------------------------------------------------------
 // Load and save
 // ---------------------------------------------------------------------------
 
@@ -407,3 +531,4 @@ renderHotkeys(current);
 // A previous Settings window may have closed mid-recording; start clean.
 void invoke("set_hotkey_recording", { active: false }).catch(() => {});
 void load();
+void loadUpdate();

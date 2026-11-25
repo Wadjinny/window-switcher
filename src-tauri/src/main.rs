@@ -17,6 +17,7 @@ mod targets;
 mod thumbnails;
 mod timing;
 mod tray;
+mod update;
 
 use std::{
     env,
@@ -90,6 +91,10 @@ fn main() {
             ipc::reset_hotkeys,
             ipc::set_hotkey_recording,
             ipc::update_thumbnails,
+            ipc::get_update_status,
+            ipc::check_for_updates,
+            ipc::install_update,
+            ipc::open_release_page,
             ipc::overlay_timing
         ])
         .setup(move |app| setup_app(app, launch))
@@ -163,6 +168,8 @@ fn setup_app(app: &mut tauri::App, launch: LaunchArgs) -> Result<(), Box<dyn std
     VERTICAL_LAYOUT.store(layout == Layout::Vertical, Ordering::SeqCst);
     log::info!("layout: {}", layout.as_str());
     SETTINGS_IN_SWITCHER.store(config.settings_in_switcher, Ordering::SeqCst);
+    update::AUTO_CHECK.store(config.check_for_updates, Ordering::SeqCst);
+    log::info!("check for updates: {}", config.check_for_updates);
     log::info!("settings in switcher: {}", config.settings_in_switcher);
     let (window_shortcut, app_shortcut) =
         startup_shortcuts(&config.window_hotkey, &config.app_hotkey);
@@ -188,6 +195,7 @@ fn setup_app(app: &mut tauri::App, launch: LaunchArgs) -> Result<(), Box<dyn std
         return Err(error.into());
     }
     log::info!("tray icon installed");
+    update::start(app.handle());
     if launch.open_settings {
         // Restarted from Settings: show it again.
         open_settings(app.handle());

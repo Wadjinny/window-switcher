@@ -146,6 +146,39 @@ input[type="checkbox"] {
   padding: 0 2px;
 }
 
+.update-row { cursor: default; }
+.update-row .option-text { flex: 1 1 auto; align-items: flex-start; }
+
+.action-button {
+  flex: 0 0 auto;
+  min-width: 112px;
+  padding: 6px 10px;
+  border: 1px solid rgba(255, 255, 255, .22);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, .07);
+  color: #fff;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+  text-align: center;
+  cursor: pointer;
+}
+
+.action-button:hover:not(:disabled) { background: rgba(255, 255, 255, .12); }
+.action-button:focus-visible { outline: 2px solid #97e3ff; outline-offset: 2px; }
+.action-button:disabled { opacity: .6; cursor: default; }
+
+.action-button.primary {
+  border-color: #55c9ff;
+  background: rgba(31, 116, 151, .38);
+  color: #e3f7ff;
+}
+
+.action-button.primary:hover:not(:disabled) { background: rgba(31, 116, 151, .55); }
+
+#update-detail.error { color: #ff9a9a; }
+
 .link-button {
   flex: 0 0 auto;
   padding: 0;

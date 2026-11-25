@@ -32,6 +32,8 @@ pub(crate) struct AppConfig {
     /// Restart elevated (through the UAC prompt) when started without
     /// administrator rights; see `elevation.rs`.
     pub(crate) run_as_admin: bool,
+    /// Check GitHub for a new release at startup and every 6 hours.
+    pub(crate) check_for_updates: bool,
 }
 
 impl Default for AppConfig {
@@ -46,11 +48,12 @@ impl Default for AppConfig {
             layout: Layout::Horizontal.as_str().into(),
             settings_in_switcher: false,
             run_as_admin: false,
+            check_for_updates: true,
         }
     }
 }
 
-fn app_data_path() -> PathBuf {
+pub(crate) fn app_data_path() -> PathBuf {
     let root = env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -235,6 +238,7 @@ mod tests {
     const GOLDEN_DEFAULT: &str = r#"{
   "app_hotkey": "Win+Tab",
   "card_style": "icon",
+  "check_for_updates": true,
   "layout": "horizontal",
   "run_as_admin": false,
   "settings_in_switcher": false,
