@@ -25,7 +25,7 @@ use crate::{
     switcher::{
         controller::{post_command, Command},
         session::payload_snapshot,
-        RUNTIME,
+        GridCell, RUNTIME,
     },
     thumbnails, timing,
     tray::refresh_tray_tooltip,
@@ -106,18 +106,15 @@ pub(crate) fn switcher_snapshot() -> Option<SwitcherPayload> {
     })
 }
 
-/// The overlay laid out opening `generation` with `per_line` cards per row
-/// (horizontal layout) or per column (vertical layout): the arrows that move
-/// across lines (Up/Down, or Left/Right in the vertical layout) move by that
-/// many cards. Only the frontend knows, since preview cards shrink to fit. Posted to the
-/// controller thread, which owns the session, so the main thread never
-/// waits on the session lock.
+/// The overlay laid out opening `generation` with its cards on `cells`
+/// (one per card, in card order): the arrows that move across lines (Up/Down,
+/// or Left/Right in the vertical layout) go to the closest card on the next
+/// line. Only the frontend knows, since preview cards shrink to fit and rows
+/// are centered. Posted to the controller thread, which owns the session, so
+/// the main thread never waits on the session lock.
 #[tauri::command]
-pub(crate) fn switcher_grid(generation: u64, per_line: u32) {
-    post_command(Command::Grid {
-        generation,
-        per_line: per_line as usize,
-    });
+pub(crate) fn switcher_grid(generation: u64, cells: Vec<GridCell>) {
+    post_command(Command::Grid { generation, cells });
 }
 
 /// The mouse clicked a card: commit that target immediately, even while the

@@ -8,7 +8,7 @@ use std::{
 
 use tauri::Emitter;
 
-use super::{ActiveSwitcher, Direction, HookRuntime, SwitcherState};
+use super::{ActiveSwitcher, Direction, GridCell, HookRuntime, SwitcherState};
 use crate::{
     input::hook::close_hook_session,
     ipc::{SelectionPayload, SwitcherPayload},
@@ -49,30 +49,24 @@ pub(crate) fn advance_switcher(
 }
 
 /// The card an arrow key moves the selection to, like Windows' own Alt+Tab.
-/// The cards are laid out in lines of `per_line` cards: rows in the
-/// horizontal layout, columns in the vertical one (which fills a column top
-/// to bottom, then wraps into the next). The arrows along a line (Left/Right
-/// horizontally, Up/Down vertically) step to the previous/next card and wrap
-/// around. The arrows across lines (Up/Down horizontally, Left/Right
-/// vertically) move one line, keeping the position in it, and stop at the
-/// first and last line; into a shorter last line they land on its last card,
-/// and with a single line (or `per_line` not reported yet) they do nothing.
-/// Pure, so it is unit tested.
+/// The cards are laid out on `grid` in lines: rows in the horizontal layout,
+/// columns in the vertical one (which fills a column top to bottom, then
+/// wraps into the next). The arrows along a line (Left/Right horizontally,
+/// Up/Down vertically) step to the previous/next card and wrap around. The
+/// arrows across lines (Up/Down horizontally, Left/Right vertically) go to
+/// the closest card on the previous/next line (the first of two equally
+/// close), and stop at the first and last line; with a single line (or no
+/// grid reported yet) they do nothing. Pure, so it is unit tested.
 pub(crate) fn navigate_index(
     selected: usize,
     count: usize,
-    per_line: usize,
+    grid: &[GridCell],
     layout: Layout,
     direction: Direction,
 ) -> usize {
     if count == 0 {
         return selected;
     }
-    let per_line = if per_line == 0 {
-        count
-    } else {
-        per_line.min(count)
-    };
     let (back, forward) = match layout {
         Layout::Horizontal => (Direction::Left, Direction::Right),
         Layout::Vertical => (Direction::Up, Direction::Down),
@@ -84,13 +78,26 @@ pub(crate) fn navigate_index(
         _ if direction == forward => return (selected + 1) % count,
         _ => return selected,
     };
-    if previous_line {
-        selected.checked_sub(per_line).unwrap_or(selected)
-    } else if selected / per_line < (count - 1) / per_line {
-        (selected + per_line).min(count - 1)
+    let Some(&from) = grid.get(selected).filter(|_| grid.len() == count) else {
+        return selected;
+    };
+    let line = if previous_line {
+        from.line.checked_sub(1)
     } else {
-        selected
-    }
+        from.line.checked_add(1)
+    };
+    let Some(line) = line else {
+        return selected;
+    };
+    grid.iter()
+        .enumerate()
+        .filter(|(_, cell)| cell.line == line)
+        .min_by(|a, b| {
+            (a.1.center - from.center)
+                .abs()
+                .total_cmp(&(b.1.center - from.center).abs())
+        })
+        .map_or(selected, |(index, _)| index)
 }
 
 /// An arrow key: move the selection of session `generation` (see
@@ -107,7 +114,7 @@ pub(crate) fn navigate_switcher(
                 let selected = navigate_index(
                     active.selected,
                     active.targets.len(),
-                    active.per_line,
+                    &active.grid,
                     active.layout,
                     direction,
                 );
@@ -122,13 +129,12 @@ pub(crate) fn navigate_switcher(
     emit_selection(runtime, watch);
 }
 
-/// The overlay reported how many cards fit in one line (row, or column in
-/// the vertical layout) of session `generation`.
-pub(crate) fn set_switcher_per_line(runtime: &HookRuntime, generation: u64, per_line: usize) {
+/// The overlay reported where it laid out the cards of session `generation`.
+pub(crate) fn set_switcher_grid(runtime: &HookRuntime, generation: u64, grid: Vec<GridCell>) {
     if let Ok(mut state) = runtime.state.lock() {
         if let Some(active) = state.active.as_mut() {
             if active.generation == generation {
-                active.per_line = per_line;
+                active.grid = grid;
             }
         }
     }
@@ -363,59 +369,100 @@ mod tests {
             targets: (0..count).map(|_| target()).collect(),
             items: Vec::<SwitchItem>::new(),
             selected,
-            per_line: 0,
+            grid: Vec::new(),
         }
+    }
+
+    /// `lines` cards per line, each card 100 px wide, every line centered
+    /// in a 700 px wide overlay like the CSS lays them out.
+    fn centered(lines: &[usize]) -> Vec<GridCell> {
+        let mut cells = Vec::new();
+        for (line, &count) in lines.iter().enumerate() {
+            let start = (700.0 - 100.0 * count as f64) / 2.0;
+            for position in 0..count {
+                cells.push(GridCell {
+                    line: line as u32,
+                    center: start + 100.0 * position as f64 + 50.0,
+                });
+            }
+        }
+        cells
     }
 
     #[test]
     fn left_and_right_step_through_the_cards_and_wrap() {
         let layout = Layout::Horizontal;
-        assert_eq!(navigate_index(0, 5, 3, layout, Direction::Right), 1);
-        assert_eq!(navigate_index(4, 5, 3, layout, Direction::Right), 0);
-        assert_eq!(navigate_index(0, 5, 3, layout, Direction::Left), 4);
-        assert_eq!(navigate_index(3, 5, 3, layout, Direction::Left), 2);
+        let grid = centered(&[3, 2]);
+        assert_eq!(navigate_index(0, 5, &grid, layout, Direction::Right), 1);
+        assert_eq!(navigate_index(4, 5, &grid, layout, Direction::Right), 0);
+        assert_eq!(navigate_index(0, 5, &grid, layout, Direction::Left), 4);
+        assert_eq!(navigate_index(3, 5, &grid, layout, Direction::Left), 2);
         // One card: nothing to move to, and no card list at all is harmless.
         assert_eq!(
-            navigate_index(0, 1, 0, Layout::Horizontal, Direction::Right),
+            navigate_index(0, 1, &[], Layout::Horizontal, Direction::Right),
             0
         );
         assert_eq!(
-            navigate_index(0, 0, 0, Layout::Horizontal, Direction::Left),
+            navigate_index(0, 0, &[], Layout::Horizontal, Direction::Left),
             0
         );
     }
 
     #[test]
-    fn up_and_down_move_between_rows_of_the_grid() {
+    fn up_and_down_go_to_the_closest_card_on_the_next_row() {
+        // Rows: [0 1 2 3 4 5 6] and a centered [7 8] under cards 2..4.
+        let grid = centered(&[7, 2]);
         let nav =
-            |selected, direction| navigate_index(selected, 8, 3, Layout::Horizontal, direction);
-        // Rows: [0 1 2] [3 4 5] [6 7].
-        assert_eq!(nav(1, Direction::Down), 4);
-        assert_eq!(nav(4, Direction::Up), 1);
-        assert_eq!(nav(4, Direction::Down), 7);
-        // Into the shorter last row: its last card.
-        assert_eq!(nav(5, Direction::Down), 7);
+            |selected, direction| navigate_index(selected, 9, &grid, Layout::Horizontal, direction);
+        // Card 1 is closest to 7, not to the card at the same index.
+        assert_eq!(nav(1, Direction::Down), 7);
+        assert_eq!(nav(6, Direction::Down), 8);
+        // Card 3 sits between 7 and 8: the first one wins.
+        assert_eq!(nav(3, Direction::Down), 7);
+        // Up from 7 and 8 is a tie between the two cards above: the first.
+        assert_eq!(nav(7, Direction::Up), 2);
+        assert_eq!(nav(8, Direction::Up), 3);
         // No wrap at the first and last rows.
         assert_eq!(nav(1, Direction::Up), 1);
-        assert_eq!(nav(6, Direction::Down), 6);
-        assert_eq!(nav(7, Direction::Down), 7);
+        assert_eq!(nav(8, Direction::Down), 8);
     }
 
     #[test]
-    fn up_and_down_do_nothing_in_a_single_row() {
-        for per_line in [0, 4, 9] {
-            for direction in [Direction::Up, Direction::Down] {
-                assert_eq!(
-                    navigate_index(2, 4, per_line, Layout::Horizontal, direction),
-                    2
-                );
+    fn up_and_down_do_nothing_in_a_single_row_or_without_a_grid() {
+        let grid = centered(&[4]);
+        for direction in [Direction::Up, Direction::Down] {
+            assert_eq!(
+                navigate_index(2, 4, &grid, Layout::Horizontal, direction),
+                2
+            );
+            assert_eq!(navigate_index(2, 4, &[], Layout::Horizontal, direction), 2);
+            // A stale grid for another card count is ignored too.
+            assert_eq!(
+                navigate_index(2, 5, &grid, Layout::Horizontal, direction),
+                2
+            );
+        }
+    }
+
+    /// Columns of `columns` cards, filled top to bottom, 50 px rows.
+    fn columns(columns: &[usize]) -> Vec<GridCell> {
+        let mut cells = Vec::new();
+        for (line, &count) in columns.iter().enumerate() {
+            for position in 0..count {
+                cells.push(GridCell {
+                    line: line as u32,
+                    center: 50.0 * position as f64 + 25.0,
+                });
             }
         }
+        cells
     }
 
     #[test]
     fn up_and_down_step_through_a_vertical_list_and_wrap() {
-        let nav = |selected, direction| navigate_index(selected, 8, 3, Layout::Vertical, direction);
+        let grid = columns(&[3, 3, 2]);
+        let nav =
+            |selected, direction| navigate_index(selected, 8, &grid, Layout::Vertical, direction);
         // Down goes on into the next column, and wraps like Left/Right do
         // horizontally.
         assert_eq!(nav(1, Direction::Down), 2);
@@ -427,23 +474,22 @@ mod tests {
 
     #[test]
     fn left_and_right_move_between_columns_of_a_vertical_list() {
-        let nav = |selected, direction| navigate_index(selected, 8, 3, Layout::Vertical, direction);
+        let grid = columns(&[3, 3, 2]);
+        let nav =
+            |selected, direction| navigate_index(selected, 8, &grid, Layout::Vertical, direction);
         // Columns: [0 1 2] [3 4 5] [6 7].
         assert_eq!(nav(1, Direction::Right), 4);
         assert_eq!(nav(4, Direction::Left), 1);
         assert_eq!(nav(4, Direction::Right), 7);
-        // Into the shorter last column: its last card.
+        // Into the shorter last column: its closest card.
         assert_eq!(nav(5, Direction::Right), 7);
         // No wrap at the first and last columns.
         assert_eq!(nav(1, Direction::Left), 1);
         assert_eq!(nav(6, Direction::Right), 6);
         // A single column (or no report yet): Left/Right do nothing.
-        for per_line in [0, 4] {
+        for grid in [columns(&[4]), Vec::new()] {
             for direction in [Direction::Left, Direction::Right] {
-                assert_eq!(
-                    navigate_index(2, 4, per_line, Layout::Vertical, direction),
-                    2
-                );
+                assert_eq!(navigate_index(2, 4, &grid, Layout::Vertical, direction), 2);
             }
         }
     }

@@ -33,11 +33,20 @@ pub(crate) struct ActiveSwitcher {
     pub(crate) targets: Vec<Target>,
     pub(crate) items: Vec<SwitchItem>,
     pub(crate) selected: usize,
-    /// Cards per line as the overlay laid them out: per row in the
-    /// horizontal layout, per column in the vertical one (reported by the
-    /// frontend, see `switcher_grid`), for the arrows that move across lines.
-    /// 0 until the first report: the cards are then treated as one line.
-    pub(crate) per_line: usize,
+    /// Where the overlay laid out each card (reported by the frontend, see
+    /// `switcher_grid`), for the arrows that move across lines. Empty until
+    /// the first report: the cards are then treated as one line.
+    pub(crate) grid: Vec<GridCell>,
+}
+
+/// One card's place in the overlay's grid: the line it is on (row in the
+/// horizontal layout, column in the vertical one, counted from 0) and the
+/// center of the card along that line, in CSS pixels. Rows can be centered,
+/// so a card's index alone does not say which card is under it.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
+pub(crate) struct GridCell {
+    pub(crate) line: u32,
+    pub(crate) center: f64,
 }
 
 #[derive(Default)]

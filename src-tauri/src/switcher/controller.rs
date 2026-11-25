@@ -24,9 +24,9 @@ use super::{
     items::target_to_item_cached,
     session::{
         active_switcher, advance_switcher, cancel_generation, commit_switcher, emit_and_show,
-        navigate_switcher, set_switcher_per_line,
+        navigate_switcher, set_switcher_grid,
     },
-    ActiveSwitcher, Direction, HookRuntime, SwitchMode, RUNTIME,
+    ActiveSwitcher, Direction, GridCell, HookRuntime, SwitchMode, RUNTIME,
 };
 use crate::{
     hotkey::shortcut_for,
@@ -80,11 +80,10 @@ pub(crate) enum Command {
         generation: u64,
         reason: &'static str,
     },
-    /// The overlay of opening `generation` lays its cards out in lines
-    /// (rows, or columns in the vertical layout) of `per_line` cards.
+    /// The overlay of opening `generation` laid its cards out on `cells`.
     Grid {
         generation: u64,
-        per_line: usize,
+        cells: Vec<GridCell>,
     },
     /// The mouse clicked card `index` of opening `generation`: commit it.
     Click {
@@ -288,10 +287,9 @@ impl Controller {
                 navigate_switcher(self.runtime, generation, direction, &mut watch);
                 timing::finish(watch, "");
             }
-            Command::Grid {
-                generation,
-                per_line,
-            } => set_switcher_per_line(self.runtime, generation, per_line),
+            Command::Grid { generation, cells } => {
+                set_switcher_grid(self.runtime, generation, cells)
+            }
             Command::Click {
                 generation,
                 index,
@@ -415,7 +413,7 @@ impl Controller {
                 targets,
                 items,
                 selected,
-                per_line: 0,
+                grid: Vec::new(),
             });
         } else {
             return;

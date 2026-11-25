@@ -11,7 +11,7 @@ import {
   type SwitchItem,
   type SwitcherPayload,
 } from "./payload";
-import { cardsPerLine } from "./grid";
+import { gridCells } from "./grid";
 import { previewScale } from "./preview-fit";
 import "./style.css";
 
@@ -442,11 +442,11 @@ function attachCardMouse(view: View, card: CardView, index: number): void {
 let lastGridReport = "";
 let gridFrame = 0;
 
-/** Tells the backend how many cards fit in one line, so the arrows move
- * between lines like Windows' own Alt+Tab: per row in the horizontal layout
- * (for Up/Down), per column in the vertical one, which fills a column top to
- * bottom and then wraps into the next (for Left/Right). Runs after layout,
- * so it is scheduled for the next animation frame. */
+/** Tells the backend where each card is, so the arrows that move between
+ * lines (Up/Down in the horizontal layout, Left/Right in the vertical one,
+ * which fills a column top to bottom and then wraps into the next) go to the
+ * closest card on the next line. Runs after layout, so it is scheduled for
+ * the next animation frame. */
 function scheduleGridReport(): void {
   if (gridFrame !== 0) return;
   gridFrame = requestAnimationFrame(() => {
@@ -454,15 +454,25 @@ function scheduleGridReport(): void {
     const view = current;
     if (!view || view.cards.length === 0) return;
     const vertical = view.layout === "vertical";
-    const perLine = cardsPerLine(
-      view.cards.map((card) =>
-        vertical ? card.element.offsetLeft : card.element.offsetTop,
+    const cells = gridCells(
+      view.cards.map(({ element }) =>
+        vertical
+          ? {
+              across: element.offsetLeft,
+              start: element.offsetTop,
+              size: element.offsetHeight,
+            }
+          : {
+              across: element.offsetTop,
+              start: element.offsetLeft,
+              size: element.offsetWidth,
+            },
       ),
     );
-    const key = `${view.generation}:${view.layout}:${perLine}`;
+    const key = `${view.generation}:${view.layout}:${JSON.stringify(cells)}`;
     if (key === lastGridReport) return;
     lastGridReport = key;
-    invoke("switcher_grid", { generation: view.generation, perLine }).catch(
+    invoke("switcher_grid", { generation: view.generation, cells }).catch(
       (error: unknown) => {
         lastGridReport = "";
         console.warn("Unable to report the switcher grid", error);
